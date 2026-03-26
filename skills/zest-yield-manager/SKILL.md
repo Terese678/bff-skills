@@ -25,7 +25,7 @@ Any agent holding sBTC has idle capital losing value to opportunity cost. This s
 - **Writes to chain.** Supply and withdraw submit Stacks transactions (cost ~50k uSTX gas + ~2 uSTX Pyth fee).
 - **Moves funds.** sBTC leaves the wallet when supplied; returns on withdraw. Funds are in Zest's audited lending pool, not a custodial address.
 - **Mainnet only.** Zest Protocol is deployed on Stacks mainnet.
-- **Supply-only by default.** The skill will NOT borrow unless explicitly overridden with `--allow-borrow`. Borrowing carries liquidation risk.
+- **Supply-only.** v1 does not implement borrowing. Future versions may add borrow support with explicit opt-in.
 - **Spend limit enforced.** Default max supply per call: 500,000 sats. Override with `--max-supply-sats`.
 - **Withdrawal always allowed.** No confirmation gate on withdrawing your own funds.
 
@@ -77,7 +77,7 @@ All outputs are JSON to stdout.
     "position": {
       "supplied_sats": 0,
       "borrowed_sats": 0,
-      "rewards_pending": false,
+      "rewards_pending_ustx": 0,
       "asset": "sBTC"
     },
     "txid": null,
