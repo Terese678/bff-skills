@@ -19,18 +19,18 @@ metadata:
 
 Monitors your active HODLMM concentrated liquidity position on Bitflow in real time. Answers the one question every LP has after opening a position: **"Am I still earning right now?"**
 
-HODLMM concentrates liquidity in discrete price bins. When price drifts outside your range, your position earns zero fees silently — no alert, no notification. This skill detects that immediately and surfaces a clear recommendation.
+HODLMM concentrates liquidity in discrete price bins. When price drifts outside your range, your position earns zero fees silently no alert, no notification. This skill detects that immediately and surfaces a clear recommendation.
 
-## Why This Skill Exists — First-Hand Discovery
+## Why This Skill Exists First-Hand Discovery
 
 On March 28 2026, the author opened a live STX/USDCx DLMM Spot position on beta.bitflow.finance. Within hours, the position went out of range:
 
 - **Position converted entirely to: 5.0007 STX / 0.00 USDCx**
 - **Fees earning: 0%**
 - **Pool was generating: $23.09K in fees on $25.23M 24h volume**
-- **Out-of-range LPs received: nothing — silently**
+- **Out-of-range LPs received: nothing silently**
 
-The pool APY showed 3933% — but only in-range LPs capture it. This skill was built to surface that gap instantly.
+The pool APY showed 3933% but only in-range LPs capture it. This skill was built to surface that gap instantly.
 
 ## Commands
 
@@ -41,7 +41,7 @@ bun run hodlmm-lp-dashboard/hodlmm-lp-dashboard.ts doctor
 ```
 
 ### `my-position`
-Full dashboard — range status, token composition, APR, recommendation.
+Full dashboard range status, token composition, APR, recommendation.
 ```bash
 bun run hodlmm-lp-dashboard/hodlmm-lp-dashboard.ts my-position \
   --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K \
@@ -49,7 +49,7 @@ bun run hodlmm-lp-dashboard/hodlmm-lp-dashboard.ts my-position \
 ```
 
 ### `earnings`
-Quick snapshot — earning right now and at what APR?
+Quick snapshot earning right now and at what APR?
 ```bash
 bun run hodlmm-lp-dashboard/hodlmm-lp-dashboard.ts earnings \
   --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K \
