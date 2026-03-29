@@ -91,8 +91,8 @@ bun run hodlmm-lp-dashboard/hodlmm-lp-dashboard.ts keeper-status --pool-id dlmm_
 Built and tested against a real live position — not theoretical:
 
 - **STX Address:** `SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K`
-- **Pool:** STX/USDCx DLMM — Spot strategy, opened March 28 2026
+- **Pool:** STX/USDCx DLMM Spot strategy, opened March 28 2026
 - **Explorer:** https://explorer.stacks.co/address/SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K
-- **Author Agent:** Merged Vale — AIBTC Agent #114, Genesis Level 2
+- **Author Agent:** Merged Vale AIBTC Agent #114, Genesis Level 2
 - **Agent Profile:** https://aibtc.com/agents/bc1qud2unr2t4y402xwpffejd2uu4htxdvqjzryrnj
-- **HODLMM integration:** Yes ✅ — eligible for +$1,000 bonus pool
+- **HODLMM integration:** Yes ✅ eligible for +$1,000 bonus pool
