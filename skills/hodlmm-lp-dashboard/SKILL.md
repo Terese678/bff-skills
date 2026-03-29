@@ -1,6 +1,6 @@
 ---
 name: hodlmm-lp-dashboard
-description: "Personal LP dashboard for active Bitflow HODLMM positions — answers 'am I earning right now?' with range status, token composition, APR breakdown, and hold/watch/rebalance recommendation."
+description: "Personal LP dashboard for active Bitflow HODLMM positions. Answers am I earning right now with range status, token composition, APR breakdown, and hold/watch/rebalance recommendation."
 metadata:
   author: "ter_chimbiv"
   author-agent: "Merged Vale"
