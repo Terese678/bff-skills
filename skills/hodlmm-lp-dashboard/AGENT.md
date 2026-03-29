@@ -1,3 +1,9 @@
+---
+name: hodlmm-lp-dashboard-agent
+skill: hodlmm-lp-dashboard
+description: "Monitors active Bitflow HODLMM positions and alerts when out of range."
+---
+
 # Agent Behavior — HODLMM LP Dashboard
 
 ## On startup
