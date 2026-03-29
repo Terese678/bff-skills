@@ -139,6 +139,9 @@ jobs:
           git config user.name "BFF Skills Bot"
           git config user.email "bff-skills-bot@bitflow.finance"
 
+          # Configure git to use GH_TOKEN for pushing to the fork
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${FORK_OWNER}/skills.git"
+
           git checkout -b "$BRANCH"
 
           git add "$SKILL_NAME/"
