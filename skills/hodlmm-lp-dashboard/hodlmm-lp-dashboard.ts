@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
 
-const BASE = "https://api.bitflow.finance/api/v1";
+const BASE = "https://beta.bitflow.finance/api/bff-proxy";
+const POOL_ID = "dlmm_3";
 
 const program = new Command();
 program.name("hodlmm-lp-dashboard").description("Personal LP dashboard for active Bitflow HODLMM positions");
@@ -10,72 +11,98 @@ program.command("doctor")
   .description("Check Bitflow API connectivity")
   .action(async () => {
     try {
-      const res = await fetch(`${BASE}/pools`);
-      if (res.ok) console.log(JSON.stringify({ result: "ok", message: "Bitflow API reachable" }));
-      else console.log(JSON.stringify({ result: "error", status: res.status }));
+      const res = await fetch(`${BASE}/api/quotes/v1/bins/${POOL_ID}`);
+      if (res.ok) {
+        console.log(JSON.stringify({ result: "ok", message: "Bitflow API reachable", pool: POOL_ID }));
+      } else {
+        console.log(JSON.stringify({ error: `API returned ${res.status}` }));
+      }
     } catch (e) {
-      console.log(JSON.stringify({ result: "error", message: String(e) }));
+      console.log(JSON.stringify({ error: String(e) }));
     }
   });
 
 program.command("my-position")
   .description("Full dashboard for your active HODLMM position")
   .requiredOption("--address <address>", "Your STX address")
-  .requiredOption("--pool-id <poolId>", "Pool ID e.g. dlmm_1")
   .action(async (opts) => {
     try {
-      const res = await fetch(`${BASE}/dlmm/pools/${opts.poolId}/positions/${opts.address}`);
-      if (!res.ok) { console.log(JSON.stringify({ error: `No position found for ${opts.address} in pool ${opts.poolId}` })); return; }
-      const data = await res.json();
-      const inRange = data.in_range ?? false;
-      const stxPct = data.token_a_pct ?? 100;
-      const usdcPct = data.token_b_pct ?? 0;
-      const apr = data.fee_apr ?? "0%";
-      const bins = data.bins_from_edge ?? 0;
+      const [posRes, poolRes] = await Promise.all([
+        fetch(`${BASE}/api/app/v1/users/${opts.address}/liquidity/${POOL_ID}`),
+        fetch(`${BASE}/api/quotes/v1/bins/${POOL_ID}`)
+      ]);
+
+      if (!posRes.ok) {
+        console.log(JSON.stringify({ error: `No position found for ${opts.address}` }));
+        return;
+      }
+
+      const pos = await posRes.json();
+      const pool = await poolRes.json();
+
+      const inRange = pos.priceRange?.coversActiveBin ?? false;
+      const activeBin = pool.active_bin_id;
+      const userBins = pos.bins ?? [];
+      const minUserBin = userBins.length ? Math.min(...userBins.map((b: any) => b.bin_id)) : null;
+      const maxUserBin = userBins.length ? Math.max(...userBins.map((b: any) => b.bin_id)) : null;
+      const binsFromRange = minUserBin && activeBin < minUserBin ? minUserBin - activeBin : 0;
+
+      const stxAmount = pos.totalLiquidity?.tokenX?.amount ?? 0;
+      const usdcxAmount = pos.totalLiquidity?.tokenY?.amount ?? 0;
+      const totalUsd = pos.totalValueUsd ?? 0;
+      const earningsUsd = pos.userEarningsUsd ?? 0;
+
+      const composition = stxAmount > 0 && usdcxAmount === 0
+        ? "100% STX — price is below your range"
+        : usdcxAmount > 0 && stxAmount === 0
+        ? "100% USDCx — price is above your range"
+        : `${((stxAmount / (stxAmount + usdcxAmount)) * 100).toFixed(1)}% STX / ${((usdcxAmount / (stxAmount + usdcxAmount)) * 100).toFixed(1)}% USDCx`;
+
+      const action = inRange ? (binsFromRange < 5 ? "watch" : "hold") : "rebalance";
+      const actionReason = inRange
+        ? `Position in range — earning fees. Active bin ${activeBin} is within your range.`
+        : `Out of range by ${binsFromRange} bins. Active bin ${activeBin} is below your range floor of ${minUserBin}. Earning 0% fees.`;
+
       console.log(JSON.stringify({
         result: "success",
-        position: { inRange, binsFromNearestEdge: bins },
-        composition: { STXPct: stxPct, USDCxPct: usdcPct, note: inRange ? "Mixed — position holds both tokens" : stxPct === 100 ? "All STX — price below range" : "All USDCx — price above range" },
-        yield: { currentlyEarning: inRange, feeAprEstimate: inRange ? apr : "0%" },
-        action: inRange && bins > 3 ? "hold" : inRange ? "watch" : "rebalance",
-        actionReason: inRange ? `Position healthy — earning ${apr} APR` : `Earning 0% fees. Rebalance to re-enter range.`
+        details: {
+          address: opts.address,
+          pool: POOL_ID,
+          inRange,
+          activeBin,
+          userBinRange: { min: minUserBin, max: maxUserBin },
+          binsFromRange,
+          composition,
+          stxAmount,
+          usdcxAmount,
+          totalValueUsd: totalUsd,
+          earningsUsd,
+          action,
+          actionReason
+        }
       }));
     } catch (e) {
       console.log(JSON.stringify({ error: String(e) }));
     }
   });
 
-program.command("earnings")
-  .description("Quick earnings snapshot")
-  .requiredOption("--address <address>", "Your STX address")
-  .requiredOption("--pool-id <poolId>", "Pool ID")
-  .action(async (opts) => {
+program.command("pool-status")
+  .description("Current pool active bin and range data")
+  .action(async () => {
     try {
-      const res = await fetch(`${BASE}/dlmm/pools/${opts.poolId}/positions/${opts.address}`);
-      if (!res.ok) { console.log(JSON.stringify({ error: "Position not found" })); return; }
+      const res = await fetch(`${BASE}/api/quotes/v1/bins/${POOL_ID}`);
+      if (!res.ok) {
+        console.log(JSON.stringify({ error: `Pool fetch failed: ${res.status}` }));
+        return;
+      }
       const data = await res.json();
       console.log(JSON.stringify({
-        earning: data.in_range ?? false,
-        apr: data.in_range ? (data.fee_apr ?? "0%") : "0%",
-        note: data.in_range ? "In range — capturing fees" : "Out of range — earning nothing"
-      }));
-    } catch (e) {
-      console.log(JSON.stringify({ error: String(e) }));
-    }
-  });
-
-program.command("keeper-status")
-  .description("Check keeper automation status")
-  .requiredOption("--pool-id <poolId>", "Pool ID")
-  .action(async (opts) => {
-    try {
-      const res = await fetch(`${BASE}/dlmm/pools/${opts.poolId}`);
-      if (!res.ok) { console.log(JSON.stringify({ error: "Pool not found" })); return; }
-      const data = await res.json();
-      console.log(JSON.stringify({
-        poolId: opts.poolId,
-        keeperEnabled: data.keeper_enabled ?? false,
-        note: data.keeper_enabled ? "Keeper active — auto rebalancing enabled" : "No keeper — manual monitoring required"
+        result: "success",
+        details: {
+          pool: POOL_ID,
+          activeBinId: data.active_bin_id,
+          totalBins: data.total_bins
+        }
       }));
     } catch (e) {
       console.log(JSON.stringify({ error: String(e) }));
