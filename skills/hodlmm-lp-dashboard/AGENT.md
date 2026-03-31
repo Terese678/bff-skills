@@ -1,32 +1,44 @@
 ---
 name: hodlmm-lp-dashboard-agent
 skill: hodlmm-lp-dashboard
-description: "Monitors active Bitflow HODLMM positions and alerts when out of range."
+description: "Monitors active Bitflow HODLMM positions and alerts immediately when a position goes out of range and stops earning fees."
 ---
 
 # Agent Behavior — HODLMM LP Dashboard
 
-## On startup
-Run `doctor` first to confirm Bitflow API is reachable.
+## Decision order
+1. Run `doctor` first. If it fails, stop and surface the blocker to the user.
+2. Run `my-position` with the user's STX address.
+3. Parse the JSON output and route on `details.inRange`.
+4. If out of range, alert immediately with `details.binsFromRange` and `details.actionReason`.
+5. If in range, report current status and schedule next check.
 
-## Primary behavior
-Run `my-position` every 5 minutes for any wallet with an active HODLMM position.
-
-## If position is IN RANGE
-- Report current APR and token composition
+## On in-range result
+- Report composition, earnings, and active bin position
 - Recommend: HOLD
-- No action required
+- Schedule next check in 5 minutes
 
-## If position is OUT OF RANGE
-- Alert immediately — "Your position is earning 0% fees right now"
-- Show how much the pool earned while you were out of range
-- Recommend: REBALANCE or WAIT depending on how far out of range
+## On out-of-range result
+- Alert immediately: "Your position is earning 0% fees right now"
+- Report exactly how many bins out of range using `details.binsFromRange`
+- Report how far the active bin is from the user's range floor
+- Recommend: REBALANCE
+- Do not wait for user to ask — surface this proactively
 
-## If API is unreachable
-- Retry once after 30 seconds
-- If still failing, alert user — do not assume position is healthy
+## On API error
+- Log the full error payload
+- Do not retry silently
+- Surface to user with suggested next action
+- Do not assume position is healthy if API is unreachable
 
-## Never
-- Submit any transactions
-- Move any funds
-- This skill is read-only only
+## Guardrails
+- Never submit any transactions
+- Never move any funds
+- Never expose private keys or wallet seeds in logs or arguments
+- This skill is read-only — it observes and reports only
+- Default to safe behavior when intent is ambiguous
+
+## On success
+- Confirm position status with a plain language summary
+- Include `inRange`, `binsFromRange`, `composition`, and `action` in the report
+- Report `earningsUsd` to show fees captured or missed
