@@ -1,3 +1,4 @@
+---
 name: hodlmm-range-rebalancer
 description: "Monitors a Bitflow HODLMM liquidity position and autonomously rebalances the bin range when the active bin moves outside the deposited range, preserving yield continuity."
 metadata:
@@ -8,32 +9,52 @@ metadata:
   entry: "hodlmm-range-rebalancer/hodlmm-range-rebalancer.ts"
   requires: "wallet, signing, settings"
   tags: "defi, write, hodlmm, bitflow, stacks, mainnet-only"
-
 ---
 
 # hodlmm-range-rebalancer
 
-Monitors a Bitflow HODLMM concentrated liquidity position and autonomously executes a bin range rebalance when the active trading bin drifts outside the LP's deposited range. Stops yield loss from out-of-range positions before it compounds.
+## What it does
+Monitors a Bitflow HODLMM concentrated liquidity position and autonomously executes a bin range rebalance when the active trading bin drifts outside the LP's deposited range. Detects out-of-range positions in real time and re-centers the bin range on the current active bin using `move-relative-liquidity-multi` (Simple mode). Stops yield loss from out-of-range positions before it compounds.
 
-## What It Does
+## Why agents need it
+An out-of-range HODLMM position earns zero trading fees — silently. A human LP cannot monitor bin drift 24/7, but an agent can. This skill gives an autonomous agent the ability to detect range drift and immediately rebalance without human intervention, keeping the position fee-generating at all times. Without this skill, an agent has no way to recover a concentrated liquidity position that has drifted out of range.
 
-- Polls the Bitflow HODLMM API for the current active bin and the agent's deposited bin range
-- Detects when the active bin has moved outside the LP's range (position is out-of-range = earning zero fees)
-- Uses `move-relative-liquidity-multi` (Simple mode) to shift bins relative to the new active bin — fewer failed transactions during fast price moves
-- Signs and broadcasts the rebalance transaction via the AIBTC wallet
-- Enforces hard spend limits and cooldowns — never rebalances more than once per hour or beyond configured slippage
+## Safety notes
+- **This skill writes to chain.** It submits a `move-relative-liquidity-multi` transaction on Stacks mainnet.
+- **This skill moves funds.** It withdraws liquidity from out-of-range bins and re-deposits into a new centered range.
+- **Mainnet only.** This skill will not run on testnet.
+- **Irreversible actions.** Rebalance transactions cannot be undone once broadcast.
+- Requires `--fee-cap` to be set — no transaction executes without an explicit spend limit.
+- Enforces a 3600s cooldown between rebalances and a hard session cap of 10 rebalances.
+- Slippage is estimated before every rebalance — aborts if estimated slippage exceeds `--max-slippage`.
 
-## Subcommands
+## Commands
 
-| Command | Description |
-|---------|-------------|
-| `doctor` | Validates API connectivity, wallet config, pool access, and API health via `/api/validation/health` |
-| `status` | Returns current position state — active bin, deposited range, in/out of range |
-| `run` | Starts autonomous monitoring and rebalances when out-of-range is detected |
+### doctor
+Checks API health, wallet readiness, pool access, and network. Safe to run anytime.
+```bash
+bun run hodlmm-range-rebalancer/hodlmm-range-rebalancer.ts doctor --pool hodlmm-sbtc-usdcx
+```
 
-## Output Contract
+### status
+Read-only position check — returns active bin, deposited range, and whether position is in or out of range.
+```bash
+bun run hodlmm-range-rebalancer/hodlmm-range-rebalancer.ts status --pool hodlmm-sbtc-usdcx --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K
+```
 
-All output is strict JSON to stdout.
+### run
+Starts autonomous monitoring loop. On each cycle: checks cooldown, fetches active bin, detects range drift, estimates slippage, and executes rebalance if out of range and within safety limits.
+```bash
+# Dry run first — always
+bun run hodlmm-range-rebalancer/hodlmm-range-rebalancer.ts run --pool hodlmm-sbtc-usdcx --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K --dry-run --fee-cap 10000
+
+# Live rebalancing
+bun run hodlmm-range-rebalancer/hodlmm-range-rebalancer.ts run --pool hodlmm-sbtc-usdcx --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K --max-slippage 1 --fee-cap 10000
+```
+
+## Output contract
+
+All outputs are strict JSON to stdout.
 
 **doctor:**
 ```json
@@ -63,7 +84,7 @@ All output is strict JSON to stdout.
 }
 ```
 
-**run (rebalance execution):**
+**run — rebalanced:**
 ```json
 {
   "status": "rebalanced",
@@ -76,7 +97,7 @@ All output is strict JSON to stdout.
 }
 ```
 
-**run (in range, no action):**
+**run — in range, no action:**
 ```json
 {
   "status": "in-range",
@@ -96,57 +117,24 @@ All output is strict JSON to stdout.
 }
 ```
 
-## Safety Limits
-
-| Limit | Value | Description |
-|-------|-------|-------------|
-| Max slippage | 1% (default) | Rebalance aborted if estimated slippage exceeds limit |
-| Cooldown | 3600s | Minimum time between rebalances |
-| Max rebalances | 10 | Hard stop after 10 rebalances per run session |
-| Spend cap | Operator-set via `--fee-cap` | No transaction executes above the configured uSTX fee cap |
-| Dry-run mode | `--dry-run` flag | Simulates all actions without broadcasting |
-
-The skill **refuses to run** without `--fee-cap` set. No spend limit = no execution.
-
-## Refusal Conditions
-
-The agent will output `{ "error": "..." }` and halt without executing any transaction if:
-
-1. `--fee-cap` is not provided
-2. Estimated slippage exceeds `--max-slippage`
-3. Network is not mainnet
-4. Wallet is not loaded or key is missing
-5. API health check fails
-6. Pool is not found or returns no bins
-7. User has no liquidity in the pool
-8. Cooldown period has not elapsed
-9. Session rebalance cap (10) has been reached
-10. Dry-run mode is active (simulates only)
-
-## Example Usage
-
-```bash
-# Check environment and pool connectivity
-bun run hodlmm-range-rebalancer.ts doctor --pool hodlmm-sbtc-usdcx
-
-# Check current position status
-bun run hodlmm-range-rebalancer.ts status --pool hodlmm-sbtc-usdcx --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K
-
-# Start autonomous monitoring (dry run first — always)
-bun run hodlmm-range-rebalancer.ts run --pool hodlmm-sbtc-usdcx --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K --dry-run --fee-cap 10000
-
-# Start live autonomous rebalancing
-bun run hodlmm-range-rebalancer.ts run --pool hodlmm-sbtc-usdcx --address SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K --max-slippage 1 --fee-cap 10000
-```
+## Known constraints
+- Requires `STACKS_PRIVATE_KEY` environment variable for write operations
+- Requires `STACKS_ADDRESS` or `--address` flag for position lookups
+- Pool ID must match a valid Bitflow HODLMM pool (e.g. `hodlmm-sbtc-usdcx`)
+- Cooldown of 3600s between rebalances is hardcoded and not configurable
+- Session cap of 10 rebalances per `run` invocation is hardcoded
+- If user has zero liquidity in the pool, skill exits with error
+- Simple mode (`move-relative-liquidity-multi`) uses `PostConditionMode.Allow`
+- API key (`BFF_API_KEY` or `--api-key`) may be required depending on Bitflow API tier
 
 ## API Reference
 
-This skill uses the official Bitflow HODLMM API (`https://bff.bitflowapis.finance/api`):
+Uses the official Bitflow HODLMM API (`https://bff.bitflowapis.finance/api`):
 
-- `GET /api/validation/health` — API health and per-pool sync status
+- `GET /api/validation/health` — API health check
 - `GET /app/v1/users/{address}/liquidity/{pool_id}` — User LP position
 - `GET /app/v1/users/{address}/positions/{pool_id}/bins` — User position bins
 - `GET /quotes/v1/bins/{pool_id}` — Pool bins and active bin
-- `GET /app/v1/pools/{pool_id}` — Pool data including fees
+- `GET /app/v1/pools/{pool_id}` — Pool data including token contracts
 
-Rebalancing uses `SP3ESW1QCNQPVXJDGQWT7E45RDCH38QBK9HEJSX4X.dlmm-liquidity-router-v-0-1` via `move-relative-liquidity-multi` (Simple mode) for resilience during active bin shifts.
+Rebalancing uses `SP3ESW1QCNQPVXJDGQWT7E45RDCH38QBK9HEJSX4X.dlmm-liquidity-router-v-0-1` via `move-relative-liquidity-multi` (Simple mode).
