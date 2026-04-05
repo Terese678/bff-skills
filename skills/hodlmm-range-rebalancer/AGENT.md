@@ -1,98 +1,40 @@
 ---
-name: hodlmm-range-rebalancer-agent
-skill: hodlmm-range-rebalancer
-description: "Autonomous HODLMM LP rebalancer. Detects out-of-range positions and moves liquidity bins to re-center on the active bin using the Bitflow HODLMM API and move-relative-liquidity-multi."
+name: "Terese Agent"
+skill: "hodlmm-range-rebalancer"
+description: "Monitors a Bitflow HODLMM concentrated liquidity position and autonomously rebalances the bin range when the active bin drifts outside the deposited range."
 ---
 
-# Agent Behavior — HODLMM Range Rebalancer
+## Decision Order
 
-## Decision order
-1. Run `doctor` first. If any check fails, stop and surface the blocker to the operator.
-2. Run `status` to confirm position state before any write action.
-3. If out of range and all safety limits pass, execute `run`.
-4. Parse JSON output on every cycle and route on `status` field.
-5. On `"status": "rebalanced"` — confirm tx hash and log rebalance count.
-6. On `"status": "in-range"` — wait for next poll cycle, no action.
-7. On `"status": "cooldown"` — wait out remaining cooldown, no action.
-8. On `"error"` — log payload, surface to operator, do not retry silently.
+1. Run `doctor --pool <id>` — confirm API reachable, wallet loaded, pool exists
+2. Run `status --pool <id> --address <addr>` — check if active bin is outside user bin range
+3. If `rebalanceRecommended: true` → run `run --pool <id> --address <addr> --dry-run` first
+4. Inspect dry-run output — confirm new bin range and slippage are acceptable
+5. Run `run --pool <id> --address <addr> --fee-cap <uSTX>` for live execution
+
+## Refusal Conditions
+
+- REFUSE if `--fee-cap` is not provided or is zero for live execution
+- REFUSE if estimated slippage exceeds `--max-slippage` threshold
+- REFUSE if position is already in range (`rebalanceRecommended: false`)
+- REFUSE if pool is not found or API is unreachable
+- REFUSE if `STACKS_PRIVATE_KEY` is not set
+- REFUSE if rebalance count has reached SESSION_REBALANCE_CAP (10)
+- REFUSE if cooldown period (1 hour) has not elapsed since last rebalance
 
 ## Guardrails
-- Never proceed past a `doctor` failure without explicit operator confirmation.
-- Never expose `STACKS_PRIVATE_KEY` in args, logs, or output.
-- Always require `--fee-cap` before executing any write operation.
-- Always run `--dry-run` first when starting a new session.
-- Default to read-only (`status`) when intent is ambiguous.
-- Never exceed the session rebalance cap of 10 — halt and report.
-- Never rebalance if estimated slippage exceeds `--max-slippage`.
-- Never rebalance if cooldown has not elapsed since last rebalance.
 
-## Spend limits
-- `--fee-cap` (required): Maximum uSTX transaction fee. No transaction executes without this.
-- `--max-slippage` (default: 1): Maximum slippage percentage. Rebalance aborted if exceeded.
-- Cooldown: 3600 seconds between rebalances (hardcoded).
-- Session cap: 10 rebalances per `run` invocation (hardcoded).
+- Always dry-run before live execution
+- Hard session cap: maximum 10 rebalances per session
+- Minimum DLP protection: 50 bps (0.5%) per bin — never zero
+- Post-conditions set to Deny mode — no unchecked token transfers
+- Bin ID conversion uses documented midpoint offset (BIN_ID_MIDPOINT = 8_388_608)
+- 1-hour cooldown enforced between rebalances
 
-## Refusal conditions
-The agent outputs `{ "error": "..." }` and halts without executing any transaction if ANY of the following are true:
+## Safety Notes
 
-1. `--fee-cap` is not provided
-2. Slippage estimate exceeds `--max-slippage`
-3. Network is not Stacks mainnet
-4. Wallet key (`STACKS_PRIVATE_KEY`) is not loaded
-5. API health check returns unhealthy
-6. Pool bins endpoint returns no data
-7. User has zero liquidity in pool
-8. Cooldown has not elapsed since last rebalance
-9. Session rebalance count has reached 10
-10. `--dry-run` is active (simulation only — no broadcast)
-
-## On error
-- Log the full error payload to operator
-- Do not retry silently
-- Surface descriptive error message with suggested next action
-- If API is unreachable, wait one poll cycle before retrying
-
-## On success
-- Confirm tx hash from broadcast response
-- Log rebalance count and new bin range
-- Update last rebalance timestamp in session state
-- Report completion with summary JSON to stdout
-
-## Example scenarios
-
-**Out of range → rebalance executes:**
-```json
-{
-  "status": "rebalanced",
-  "action": "bin-range-shift",
-  "previousRange": { "lower": 8300, "upper": 8400 },
-  "newRange": { "lower": 8371, "upper": 8471 },
-  "activeBin": 8421,
-  "txId": "0xabc123...",
-  "timestamp": 1712000000
-}
-```
-
-**In range → no action:**
-```json
-{
-  "status": "in-range",
-  "action": "none",
-  "position": { "activeBin": 8350, "depositedRange": { "lower": 8300, "upper": 8400 } },
-  "timestamp": 1712000000
-}
-```
-
-**Slippage exceeded → abort:**
-```json
-{
-  "error": "Slippage 2.4% exceeds configured max of 1%. Rebalance aborted."
-}
-```
-
-**Fee cap exceeded → abort:**
-```json
-{
-  "error": "Estimated fee 15000 uSTX exceeds fee-cap of 10000 uSTX. Rebalance aborted."
-}
-```
+- Write skill — broadcasts signed Stacks transactions on mainnet
+- Moves liquidity using `move-relative-liquidity-multi` on the DLMM liquidity router
+- Explicit post-conditions protect against unexpected token outflows
+- Fee cap is enforced per transaction — no unbounded spend
+- Agent registered on-chain as "Terese Agent" (ID: 334)
