@@ -25,6 +25,7 @@ const LIQUIDITY_ROUTER_CONTRACT =
   "SP3ESW1QCNQPVXJDGQWT7E45RDCH38QBK9HEJSX4X.dlmm-liquidity-router-v-0-1";
 const RATE_LIMIT_MS = 10_000;
 const COOLDOWN_MS = 3_600_000;
+// FIX 1: MAX_COMPOUNDS unified — was 20 in code but 24 in AGENT.md. Now 20 everywhere.
 const MAX_COMPOUNDS = 20;
 const DEFAULT_MAX_SLIPPAGE = 0.01;
 const DEFAULT_MIN_THRESHOLD = 10_000;
@@ -33,7 +34,6 @@ const TX_CONFIRM_POLL_MS = 10_000;
 const TX_CONFIRM_TIMEOUT_MS = 300_000;
 
 // Bin ID midpoint offset — Bitflow stores unsigned bin IDs offset by 2^23
-// Subtract this to convert to signed bin ID expected by the Clarity contract
 const BIN_ID_MIDPOINT = 8_388_608;
 function toSignedBinId(unsignedBinId: number): number {
   return unsignedBinId - BIN_ID_MIDPOINT;
@@ -63,6 +63,10 @@ interface PoolData {
   y_protocol_fee: number;
   y_provider_fee: number;
   y_variable_fee: number;
+  // DLP/reserve ratio fields for min-dlp calculation
+  total_supply?: number;
+  reserve_x?: number;
+  reserve_y?: number;
 }
 
 interface CompoundStatus {
@@ -203,6 +207,26 @@ function calculateBinWithdrawalAmounts(
   };
 }
 
+// FIX 2: Compute expected DLP and apply slippage tolerance for real min-dlp protection
+function computeMinDlp(
+  harvestedX: number,
+  harvestedY: number,
+  poolTotalSupply: number,
+  poolReserveX: number,
+  poolReserveY: number,
+  maxSlippage: number
+): number {
+  if (poolTotalSupply === 0 || (poolReserveX === 0 && poolReserveY === 0)) return 1;
+  // Estimate DLP tokens from contributed reserves ratio
+  const xRatio = poolReserveX > 0 ? harvestedX / poolReserveX : 0;
+  const yRatio = poolReserveY > 0 ? harvestedY / poolReserveY : 0;
+  const ratio = Math.min(xRatio, yRatio);
+  const expectedDlp = Math.floor(ratio * poolTotalSupply);
+  // Apply slippage tolerance — accept at least (1 - maxSlippage) of expected DLP
+  const minDlp = Math.floor(expectedDlp * (1 - maxSlippage));
+  return Math.max(minDlp, 1); // never zero
+}
+
 async function executeHarvest(
   poolData: PoolData,
   userBins: PositionBin[],
@@ -254,7 +278,6 @@ async function executeHarvest(
       "pool-trait": contractPrincipalCV(poolContractAddress, poolContractName),
       "x-token-trait": contractPrincipalCV(xTokenAddress, xTokenName),
       "y-token-trait": contractPrincipalCV(yTokenAddress, yTokenName),
-      // FIX: use documented BIN_ID_MIDPOINT offset instead of magic -500
       "bin-id": intCV(toSignedBinId(bin.bin_id)),
       amount: uintCV(amounts.liquidityToRemove),
       "min-x-amount": uintCV(amounts.minXAmount),
@@ -296,7 +319,7 @@ async function executeReinvest(
   walletAddress: string,
   privateKey: string,
   feeCap: number,
-  slippageTolerance: number,
+  maxSlippage: number,
   dryRun: boolean
 ): Promise<{ txId: string | null; reinvestedBins: Array<{ binId: number; xAmount: number; yAmount: number }> }> {
   const network = new StacksMainnet();
@@ -309,7 +332,6 @@ async function executeReinvest(
   const yTokenAddress = poolData.y_token.split(".")[0];
   const yTokenName = poolData.y_token.split(".")[1];
 
-  // FIX: asset info needed for Deny-mode post-conditions
   const xAssetName = await getTokenAssetName(poolData.x_token);
   const yAssetName = await getTokenAssetName(poolData.y_token);
   const xAssetInfo = createAssetInfo(xTokenAddress, xTokenName, xAssetName);
@@ -318,21 +340,42 @@ async function executeReinvest(
   const reinvestedBins = [{ binId: poolData.active_bin_id, xAmount: harvestedX, yAmount: harvestedY }];
   if (dryRun) return { txId: null, reinvestedBins };
 
+  // FIX 2: Compute real min-dlp using pool DLP/reserve ratio and slippage tolerance
+  const minDlp = computeMinDlp(
+    harvestedX,
+    harvestedY,
+    poolData.total_supply ?? 0,
+    poolData.reserve_x ?? 0,
+    poolData.reserve_y ?? 0,
+    maxSlippage
+  );
+
   const binAddPositions = [
     tupleCV({
       "active-bin-id-offset": intCV(0),
       "x-amount": uintCV(harvestedX),
       "y-amount": uintCV(harvestedY),
-      "min-dlp": uintCV(1), // FIX: non-zero min-dlp
+      // FIX 2: real min-dlp — expectedDlp * (1 - maxSlippage), never zero
+      "min-dlp": uintCV(minDlp),
       "max-x-liquidity-fee": uintCV(Math.ceil(harvestedX * 0.02)),
       "max-y-liquidity-fee": uintCV(Math.ceil(harvestedY * 0.02)),
     }),
   ];
 
-  // FIX: PostConditionMode.Deny + explicit post-conditions (was Allow with empty array)
+  // FIX 3: FungibleConditionCode.Equal with exact harvest amounts (tighter than GreaterEqual "1")
   const postConditions = [
-    makeStandardFungiblePostCondition(walletAddress, FungibleConditionCode.GreaterEqual, "1", xAssetInfo),
-    makeStandardFungiblePostCondition(walletAddress, FungibleConditionCode.GreaterEqual, "1", yAssetInfo),
+    makeStandardFungiblePostCondition(
+      walletAddress,
+      FungibleConditionCode.Equal,
+      Math.floor(harvestedX).toString(),
+      xAssetInfo
+    ),
+    makeStandardFungiblePostCondition(
+      walletAddress,
+      FungibleConditionCode.Equal,
+      Math.floor(harvestedY).toString(),
+      yAssetInfo
+    ),
   ];
 
   const txOptions = {
@@ -518,7 +561,11 @@ async function runCompound(options: {
           continue;
         }
       }
-      const { txId: reinvestTxId, reinvestedBins } = await executeReinvest(pool, harvestedX, harvestedY, wallet.address, wallet.privateKey, feeCap, maxSlippage * 100, dryRun);
+      const { txId: reinvestTxId, reinvestedBins } = await executeReinvest(
+        pool, harvestedX, harvestedY,
+        wallet.address, wallet.privateKey,
+        feeCap, maxSlippage, dryRun
+      );
       compoundCount++;
       lastCompoundTime = Date.now();
       out({
