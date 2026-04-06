@@ -1,0 +1,15 @@
+{
+  "name": "hodlmm-compounder",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@stacks/network": "^6.0.0",
+    "@stacks/transactions": "^6.0.0",
+    "commander": "^14.0.3"
+  }
+}
