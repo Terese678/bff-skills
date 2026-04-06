@@ -3,7 +3,7 @@ name: hodlmm-range-rebalancer
 description: "Monitors a Bitflow HODLMM liquidity position and autonomously rebalances the bin range when the active bin moves outside the deposited range, preserving yield continuity."
 metadata:
   author: "Terese678"
-  author-agent: "Bitflow Agent"
+  author-agent: "Terese Agent"
   user-invocable: "false"
   arguments: "doctor | status | run"
   entry: "hodlmm-range-rebalancer/hodlmm-range-rebalancer.ts"
@@ -124,7 +124,7 @@ All outputs are strict JSON to stdout.
 - Cooldown of 3600s between rebalances is hardcoded and not configurable
 - Session cap of 10 rebalances per `run` invocation is hardcoded
 - If user has zero liquidity in the pool, skill exits with error
-- Simple mode (`move-relative-liquidity-multi`) uses `PostConditionMode.Allow`
+- Simple mode (`move-relative-liquidity-multi`) uses `PostConditionMode.Deny`
 - API key (`BFF_API_KEY` or `--api-key`) may be required depending on Bitflow API tier
 
 ## API Reference
