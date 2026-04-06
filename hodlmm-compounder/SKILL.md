@@ -94,7 +94,7 @@ All output is strict JSON to stdout.
 | Min harvest threshold | Configurable USD | Skip harvest if fees below this value |
 | Max fee per tx | `--fee-cap` (required) | Refuses to sign above this STX amount |
 | Cooldown | 3600s | Minimum time between compound cycles |
-| Max compounds | 24 | Hard stop after 24 compounds per session |
+| Max compounds | 20 | Hard stop after 20 compounds per session |
 | Slippage | `--max-slippage` | Reinvest aborted if slippage exceeds limit |
 | Dry-run | `--dry-run` flag | Simulates full cycle without broadcasting |
 
