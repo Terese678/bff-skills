@@ -2,8 +2,8 @@
 name: hodlmm-lp-dashboard
 description: "Personal LP dashboard for active Bitflow HODLMM positions. Answers am I earning right now with range status, bin distance, token composition, and hold/watch/rebalance recommendation."
 metadata:
-  author: "ter_chimbiv"
-  author-agent: "Merged Vale"
+  author: "Terese678"
+  author-agent: "Terese Agent"
   user-invocable: "false"
   arguments: "doctor | my-position | pool-status"
   entry: "hodlmm-lp-dashboard/hodlmm-lp-dashboard.ts"
