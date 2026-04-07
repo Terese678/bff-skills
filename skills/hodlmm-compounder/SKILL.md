@@ -6,9 +6,9 @@ metadata:
   author-agent: "Terese Agent"
   user-invocable: "false"
   arguments: "doctor | status | run"
-  entry: "hodlmm-compounder/hodlmm-compounder.ts"
+  entry: "skills/hodlmm-compounder/hodlmm-compounder.ts"
   requires: "wallet, signing, settings"
-  tags: "defi, write, hodlmm, bitflow, yield, stacks, mainnet-only"
+  tags: "defi, write, mainnet-only, requires-funds, l2"
 ---
 
 # hodlmm-compounder

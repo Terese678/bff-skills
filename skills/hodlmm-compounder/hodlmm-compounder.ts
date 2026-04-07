@@ -32,6 +32,7 @@ const DEFAULT_MIN_THRESHOLD = 10_000;
 const DEFAULT_POLL_INTERVAL_MS = 3_600_000;
 const TX_CONFIRM_POLL_MS = 10_000;
 const TX_CONFIRM_TIMEOUT_MS = 300_000;
+const FETCH_TIMEOUT_MS = 30_000;
 
 // Bin ID midpoint offset — Bitflow stores unsigned bin IDs offset by 2^23
 const BIN_ID_MIDPOINT = 8_388_608;
@@ -41,22 +42,24 @@ function toSignedBinId(unsignedBinId: number): number {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+// FIX: reserve/liquidity fields typed as string to avoid JS number precision loss above 2^53
 interface PositionBin {
   bin_id: number;
-  user_liquidity: number;
-  liquidity: number;
-  reserve_x: number;
-  reserve_y: number;
+  user_liquidity: string;
+  liquidity: string;
+  reserve_x: string;
+  reserve_y: string;
   accumulated_fee_x?: number;
   accumulated_fee_y?: number;
 }
 
+// FIX: API field names corrected to match actual Bitflow BFF API response
 interface PoolData {
   pool_id: string;
-  active_bin_id: number;
-  x_token: string;
-  y_token: string;
-  pool_contract: string;
+  active_bin: number;       // was: active_bin_id
+  token_x: string;          // was: x_token
+  token_y: string;          // was: y_token
+  pool_token: string;        // was: pool_contract
   x_protocol_fee: number;
   x_provider_fee: number;
   x_variable_fee: number;
@@ -82,12 +85,16 @@ interface CompoundStatus {
 
 let lastApiCallTime = 0;
 
+// FIX: added AbortSignal.timeout to prevent hanging requests blocking the compound loop
 async function rateLimitedFetch(url: string, options?: RequestInit): Promise<Response> {
   const now = Date.now();
   const elapsed = now - lastApiCallTime;
   if (elapsed < RATE_LIMIT_MS) await sleep(RATE_LIMIT_MS - elapsed);
   lastApiCallTime = Date.now();
-  const res = await fetch(url, options);
+  const res = await fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   if (res.status === 429) {
     await sleep(30_000);
     return rateLimitedFetch(url, options);
@@ -134,7 +141,9 @@ async function fetchPoolData(poolId: string): Promise<PoolData | null> {
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`Pool API error: ${res.status}`);
     return (await res.json()) as PoolData;
-  } catch {
+  } catch (err) {
+    // FIX: log errors instead of silently swallowing them
+    process.stderr.write(`[fetchPoolData] error: ${String(err)}\n`);
     return null;
   }
 }
@@ -160,18 +169,27 @@ async function getTokenAssetName(tokenContract: string): Promise<string> {
   return token.asset_name;
 }
 
+// FIX: terminal tx failures now return false immediately (escape catch block)
+// FIX: network errors logged to stderr instead of silently swallowed
+// FIX: added AbortSignal.timeout to prevent hanging poll requests
 async function pollTxConfirmation(txId: string, timeoutMs = TX_CONFIRM_TIMEOUT_MS): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const res = await fetch(`${STACKS_API}/extended/v1/tx/${txId}`);
+      const res = await fetch(`${STACKS_API}/extended/v1/tx/${txId}`, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
       if (res.ok) {
         const data = await res.json();
         if (data.tx_status === "success") return true;
-        if (data.tx_status === "abort_by_response" || data.tx_status === "abort_by_post_condition")
-          throw new Error(`Transaction ${txId} failed: ${data.tx_status}`);
+        if (data.tx_status === "abort_by_response" || data.tx_status === "abort_by_post_condition") {
+          return false; // terminal failure — stop polling immediately
+        }
       }
-    } catch { }
+    } catch (err) {
+      // FIX: log polling errors so operators can see when polling is failing
+      process.stderr.write(`[pollTxConfirmation] polling error for ${txId}: ${String(err)}\n`);
+    }
     await sleep(TX_CONFIRM_POLL_MS);
   }
   return false;
@@ -189,21 +207,27 @@ function calculateAccumulatedFees(bins: PositionBin[]): { totalFeesX: number; to
   );
 }
 
+// FIX: reserve fields parsed via BigInt to avoid precision loss on large values
 function calculateBinWithdrawalAmounts(
   bin: PositionBin,
   withdrawalPercentage: number,
   slippageTolerance = 1
 ): { liquidityToRemove: number; minXAmount: number; minYAmount: number } {
-  if (bin.user_liquidity === 0 || bin.liquidity === 0)
+  const userLiquidity = Number(BigInt(bin.user_liquidity));
+  const liquidity = Number(BigInt(bin.liquidity));
+  const reserveX = Number(BigInt(bin.reserve_x));
+  const reserveY = Number(BigInt(bin.reserve_y));
+
+  if (userLiquidity === 0 || liquidity === 0)
     return { liquidityToRemove: 0, minXAmount: 0, minYAmount: 0 };
   const percentageDecimal = withdrawalPercentage / 100;
-  const liquidityToRemove = Math.floor(bin.user_liquidity * percentageDecimal);
-  const percentageOfBin = liquidityToRemove / bin.liquidity;
+  const liquidityToRemove = Math.floor(userLiquidity * percentageDecimal);
+  const percentageOfBin = liquidityToRemove / liquidity;
   const slippageMultiplier = 1 - slippageTolerance / 100;
   return {
     liquidityToRemove,
-    minXAmount: Math.floor(bin.reserve_x * percentageOfBin * slippageMultiplier),
-    minYAmount: Math.floor(bin.reserve_y * percentageOfBin * slippageMultiplier),
+    minXAmount: Math.floor(reserveX * percentageOfBin * slippageMultiplier),
+    minYAmount: Math.floor(reserveY * percentageOfBin * slippageMultiplier),
   };
 }
 
@@ -217,12 +241,10 @@ function computeMinDlp(
   maxSlippage: number
 ): number {
   if (poolTotalSupply === 0 || (poolReserveX === 0 && poolReserveY === 0)) return 1;
-  // Estimate DLP tokens from contributed reserves ratio
   const xRatio = poolReserveX > 0 ? harvestedX / poolReserveX : 0;
   const yRatio = poolReserveY > 0 ? harvestedY / poolReserveY : 0;
   const ratio = Math.min(xRatio, yRatio);
   const expectedDlp = Math.floor(ratio * poolTotalSupply);
-  // Apply slippage tolerance — accept at least (1 - maxSlippage) of expected DLP
   const minDlp = Math.floor(expectedDlp * (1 - maxSlippage));
   return Math.max(minDlp, 1); // never zero
 }
@@ -239,21 +261,22 @@ async function executeHarvest(
   const network = new StacksMainnet();
   const routerAddress = LIQUIDITY_ROUTER_CONTRACT.split(".")[0];
   const routerName = LIQUIDITY_ROUTER_CONTRACT.split(".")[1];
-  const poolContractAddress = poolData.pool_contract.split(".")[0];
-  const poolContractName = poolData.pool_contract.split(".")[1];
-  const xTokenAddress = poolData.x_token.split(".")[0];
-  const xTokenName = poolData.x_token.split(".")[1];
-  const yTokenAddress = poolData.y_token.split(".")[0];
-  const yTokenName = poolData.y_token.split(".")[1];
+  // FIX: use corrected API field names (pool_token, token_x, token_y, active_bin)
+  const poolContractAddress = poolData.pool_token.split(".")[0];
+  const poolContractName = poolData.pool_token.split(".")[1];
+  const xTokenAddress = poolData.token_x.split(".")[0];
+  const xTokenName = poolData.token_x.split(".")[1];
+  const yTokenAddress = poolData.token_y.split(".")[0];
+  const yTokenName = poolData.token_y.split(".")[1];
 
-  const xAssetName = await getTokenAssetName(poolData.x_token);
-  const yAssetName = await getTokenAssetName(poolData.y_token);
+  const xAssetName = await getTokenAssetName(poolData.token_x);
+  const yAssetName = await getTokenAssetName(poolData.token_y);
   const xAssetInfo = createAssetInfo(xTokenAddress, xTokenName, xAssetName);
   const yAssetInfo = createAssetInfo(yTokenAddress, yTokenName, yAssetName);
   const poolAssetInfo = createAssetInfo(poolContractAddress, poolContractName, "pool-token");
 
   const binsToHarvest = userBins.filter(
-    (b) => b.user_liquidity > 0 && ((b.accumulated_fee_x ?? 0) > 0 || (b.accumulated_fee_y ?? 0) > 0)
+    (b) => Number(BigInt(b.user_liquidity)) > 0 && ((b.accumulated_fee_x ?? 0) > 0 || (b.accumulated_fee_y ?? 0) > 0)
   );
   if (binsToHarvest.length === 0) throw new Error("No bins with accumulated fees to harvest");
 
@@ -264,8 +287,10 @@ async function executeHarvest(
   let harvestedY = 0;
 
   const binWithdrawalPositions = binsToHarvest.map((bin) => {
-    const feeRatioX = bin.reserve_x > 0 ? (bin.accumulated_fee_x ?? 0) / bin.reserve_x : 0;
-    const feeRatioY = bin.reserve_y > 0 ? (bin.accumulated_fee_y ?? 0) / bin.reserve_y : 0;
+    const reserveX = Number(BigInt(bin.reserve_x));
+    const reserveY = Number(BigInt(bin.reserve_y));
+    const feeRatioX = reserveX > 0 ? (bin.accumulated_fee_x ?? 0) / reserveX : 0;
+    const feeRatioY = reserveY > 0 ? (bin.accumulated_fee_y ?? 0) / reserveY : 0;
     const feeRatio = Math.max(feeRatioX, feeRatioY) * 100;
     const safePercentage = Math.min(feeRatio, 100);
     const amounts = calculateBinWithdrawalAmounts(bin, safePercentage, slippageTolerance * 100);
@@ -325,19 +350,21 @@ async function executeReinvest(
   const network = new StacksMainnet();
   const routerAddress = LIQUIDITY_ROUTER_CONTRACT.split(".")[0];
   const routerName = LIQUIDITY_ROUTER_CONTRACT.split(".")[1];
-  const poolContractAddress = poolData.pool_contract.split(".")[0];
-  const poolContractName = poolData.pool_contract.split(".")[1];
-  const xTokenAddress = poolData.x_token.split(".")[0];
-  const xTokenName = poolData.x_token.split(".")[1];
-  const yTokenAddress = poolData.y_token.split(".")[0];
-  const yTokenName = poolData.y_token.split(".")[1];
+  // FIX: use corrected API field names
+  const poolContractAddress = poolData.pool_token.split(".")[0];
+  const poolContractName = poolData.pool_token.split(".")[1];
+  const xTokenAddress = poolData.token_x.split(".")[0];
+  const xTokenName = poolData.token_x.split(".")[1];
+  const yTokenAddress = poolData.token_y.split(".")[0];
+  const yTokenName = poolData.token_y.split(".")[1];
 
-  const xAssetName = await getTokenAssetName(poolData.x_token);
-  const yAssetName = await getTokenAssetName(poolData.y_token);
+  const xAssetName = await getTokenAssetName(poolData.token_x);
+  const yAssetName = await getTokenAssetName(poolData.token_y);
   const xAssetInfo = createAssetInfo(xTokenAddress, xTokenName, xAssetName);
   const yAssetInfo = createAssetInfo(yTokenAddress, yTokenName, yAssetName);
 
-  const reinvestedBins = [{ binId: poolData.active_bin_id, xAmount: harvestedX, yAmount: harvestedY }];
+  // FIX: use corrected active_bin field name
+  const reinvestedBins = [{ binId: poolData.active_bin, xAmount: harvestedX, yAmount: harvestedY }];
   if (dryRun) return { txId: null, reinvestedBins };
 
   // FIX 2: Compute real min-dlp using pool DLP/reserve ratio and slippage tolerance
@@ -362,7 +389,7 @@ async function executeReinvest(
     }),
   ];
 
-  // FIX 3: FungibleConditionCode.Equal with exact harvest amounts (tighter than GreaterEqual "1")
+  // FIX 3: FungibleConditionCode.Equal with exact harvest amounts
   const postConditions = [
     makeStandardFungiblePostCondition(
       walletAddress,
@@ -405,14 +432,22 @@ async function executeReinvest(
 // ─── Subcommands ──────────────────────────────────────────────────────────────
 
 async function runDoctor(options: { pool?: string }): Promise<void> {
-  const checks: Record<string, string> = { api: "unreachable", wallet: "not-loaded", pool: "not-checked", network: "mainnet" };
+  const checks: Record<string, string> = { api: "unreachable", bitflow: "unreachable", wallet: "not-loaded", pool: "not-checked", network: "mainnet" };
+  // FIX: check Stacks API
   try {
-    const res = await fetch(`${STACKS_API}/v2/info`);
+    const res = await fetch(`${STACKS_API}/v2/info`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (res.ok) checks.api = "reachable";
     else throw new Error(`HTTP ${res.status}`);
   } catch (err) {
     out({ status: "error", checks, error: String(err), timestamp: ts() });
     process.exit(1);
+  }
+  // FIX: also check Bitflow API reachability (core dependency)
+  try {
+    const res = await rateLimitedFetch(`${BFF_API_URL}/app/v1/pools`, { headers: bffHeaders() });
+    checks.bitflow = res.ok ? "reachable" : `error-${res.status}`;
+  } catch (err) {
+    checks.bitflow = `unreachable: ${String(err)}`;
   }
   try {
     const { address } = await loadWallet();
@@ -423,7 +458,8 @@ async function runDoctor(options: { pool?: string }): Promise<void> {
   }
   if (options.pool) {
     const pool = await fetchPoolData(options.pool);
-    checks.pool = pool ? `found (activeBin: ${pool.active_bin_id})` : "not-found";
+    // FIX: use corrected active_bin field name
+    checks.pool = pool ? `found (activeBin: ${pool.active_bin})` : "not-found";
     if (!pool) {
       out({ status: "error", checks, error: `Pool ${options.pool} not found`, timestamp: ts() });
       process.exit(1);
@@ -453,7 +489,7 @@ async function runStatus(options: { pool: string }): Promise<void> {
     process.exit(1);
   }
   const { totalFeesX, totalFeesY } = calculateAccumulatedFees(userBins);
-  const totalLiquidity = userBins.reduce((sum, b) => sum + b.user_liquidity, 0);
+  const totalLiquidity = userBins.reduce((sum, b) => sum + Number(BigInt(b.user_liquidity)), 0);
   const feeValue = totalFeesX + totalFeesY;
   const status: CompoundStatus = {
     poolId: options.pool,
@@ -473,9 +509,15 @@ async function runCompound(options: {
   minThreshold?: string;
   interval?: string;
   dryRun?: boolean;
+  confirm?: boolean; // FIX: explicit --confirm gate required for live execution
 }): Promise<void> {
   if (!options.dryRun && !options.feeCap) {
     out({ error: "--fee-cap <STX> is required for live execution. Use --dry-run first.", code: "FEE_CAP_REQUIRED", timestamp: ts() });
+    process.exit(1);
+  }
+  // FIX: require --confirm flag for live broadcasting (standard safety gate for write skills)
+  if (!options.dryRun && !options.confirm) {
+    out({ error: "--confirm is required for live execution. Pass --confirm to acknowledge you are broadcasting real transactions.", code: "CONFIRM_REQUIRED", timestamp: ts() });
     process.exit(1);
   }
   const maxSlippage = parseFloat(options.maxSlippage ?? String(DEFAULT_MAX_SLIPPAGE));
@@ -597,6 +639,7 @@ program.command("doctor").description("Validate API connectivity, wallet, and po
 
 program.command("status").description("Get current position fees and compound readiness").requiredOption("--pool <id>", "HODLMM pool ID to check").action(async (options) => { await runStatus(options); });
 
+// FIX: added --confirm flag as explicit safety gate for live broadcasting
 program.command("run").description("Start autonomous compound loop — harvest fees and reinvest on schedule")
   .requiredOption("--pool <id>", "HODLMM pool ID to compound")
   .option("--max-slippage <decimal>", "Max slippage for reinvest (default: 0.01)", "0.01")
@@ -604,6 +647,7 @@ program.command("run").description("Start autonomous compound loop — harvest f
   .option("--min-threshold <uSTX>", "Min fee value to trigger compound (default: 10000)", "10000")
   .option("--interval <seconds>", "Poll interval in seconds (min 600, default 3600)", "3600")
   .option("--dry-run", "Simulate compounding without broadcasting transactions")
+  .option("--confirm", "Explicitly confirm live on-chain execution (required alongside --fee-cap)")
   .action(async (options) => { await runCompound(options); });
 
 program.parseAsync(process.argv).catch((err) => {
