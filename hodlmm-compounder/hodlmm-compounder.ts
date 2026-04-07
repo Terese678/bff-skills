@@ -169,7 +169,7 @@ async function pollTxConfirmation(txId: string, timeoutMs = TX_CONFIRM_TIMEOUT_M
         const data = await res.json();
         if (data.tx_status === "success") return true;
         if (data.tx_status === "abort_by_response" || data.tx_status === "abort_by_post_condition")
-          throw new Error(`Transaction ${txId} failed: ${data.tx_status}`);
+          return false; // terminal failure — do not retry
       }
     } catch { }
     await sleep(TX_CONFIRM_POLL_MS);
