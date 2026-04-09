@@ -85,6 +85,20 @@ bun run dlmm-position-analyst.ts reposition
 # Just read the analysis, no write action
 bun run dlmm-position-analyst.ts analyze
 ```
+## Why agents need it
+
+DLMM positions go out of range silently — earning zero fees with no alert. Agents need this skill to autonomously detect out-of-range positions, analyze historical price patterns to find the optimal new range, and reposition liquidity without human intervention. Without it, agents cannot manage concentrated liquidity positions on Bitflow or react to price movement in real time.
+
+## Safety notes
+
+- Write actions only trigger on explicit `reposition` command — `analyze` and `status` are read-only
+- Never repositions a position that is currently in range and earning fees
+- Slippage hard cap: 4% — transaction aborts if exceeded
+- Max spend equals existing position value — no new capital is ever added
+- Dust threshold: refuses to act on positions below 0.01 STX
+- One reposition per run — no chaining
+- Returns transaction ID as proof for every write action
+- Mainnet only — never runs against testnet pools with mainnet funds
 
 ## Safety
 
