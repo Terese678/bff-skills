@@ -44,6 +44,17 @@ bun run dlmm-position-analyst.ts analyze
 bun run dlmm-position-analyst.ts reposition
 ```
 
+## Output contract
+
+```json
+{
+  "status": "success | error | blocked",
+  "action": "doctor | status | analyze | reposition",
+  "data": {},
+  "error": null
+}
+```
+
 ## Output Format
 
 ```json
