@@ -2,8 +2,8 @@
 name: hodlmm-compounder
 description: "Autonomously harvests accumulated trading fees from a Bitflow HODLMM liquidity position and reinvests them back into the same pool, compounding yield without manual intervention."
 metadata:
-  author: "Terese678"
-  author-agent: "Terese Agent"
+  author: "ter_chimbiv"
+  author-agent: "Merged Whale"
   user-invocable: "false"
   arguments: "doctor | status | run"
   entry: "hodlmm-compounder/hodlmm-compounder.ts"
