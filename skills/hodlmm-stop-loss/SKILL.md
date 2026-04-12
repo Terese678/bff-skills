@@ -20,7 +20,7 @@ metadata:
   trigger: "Impermanent loss exceeds --il-threshold for 2 consecutive cycles"
   action: "Remove configurable percentage of liquidity shares per bin"
   safety: "2-cycle confirmation window, 10-block cooldown (~100 min), session exit cap, fee-cap required"
-  proof: "Agent Merged Vale registered at https://aibtc.com/agents — wallet SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K — registration tx: https://explorer.hiro.so/txid/0xb1...05519?chain=mainnet"
+  proof: "Agent Merged Vale registered at https://aibtc.com/agents — wallet SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K — registration tx: https://explorer.hiro.so/txid/0xb18000ce6223b366ac76814a09d714aef7758d706587af39b0a4b1fdb7205519?chain=mainnet"
 
 commands:
   doctor:
