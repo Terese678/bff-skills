@@ -1,655 +1,832 @@
 #!/usr/bin/env bun
-
 /**
- * hodlmm-stop-loss — HODLMM Stop-Loss Sentinel
+ * hodlmm-stop-loss — Impermanent loss guardian for Bitflow HODLMM positions.
  *
- * Monitors a Bitflow HODLMM position for value erosion using a high-water mark
- * strategy. When drawdown exceeds the configured threshold, autonomously removes
- * a configurable percentage of LP shares to protect capital.
+ * Monitors a HODLMM position for impermanent loss (IL) in real time.
+ * When IL breaches the user-defined threshold for two consecutive cycles
+ * (confirmation window), autonomously withdraws a configurable percentage
+ * of LP shares via withdraw-liquidity-same-multi on the DLMM router.
  *
- * Architecture: Sentinel loop with high-water mark tracking, cooldown enforcement,
- * and session-capped autonomous execution.
+ * Commands:
+ *   doctor   — validate environment, APIs, wallet balance
+ *   status   — snapshot current position and report live IL
+ *   run      — autonomous stop-loss guardian loop
  */
 
 import { Command } from "commander";
-import {
-  makeContractCall,
-  broadcastTransaction,
-  uintCV,
-  listCV,
-  tupleCV,
-  noneCV,
-  PostConditionMode,
-  FungibleConditionCode,
-  makeContractFungiblePostCondition,
-  createAssetInfo,
-  AnchorMode,
-  fetchCallReadOnlyFunction,
-  cvToJSON,
-} from "@stacks/transactions";
-import { StacksMainnet } from "@stacks/network";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const BITFLOW_API = "https://bff.bitflowapis.finance";
-const BITFLOW_DLMM_CONTRACT = "SPQC38PW542EQJ5M11CR25P7BS1CA6QT4TBXGB3M";
-const STACKS_API = "https://api.mainnet.hiro.so";
-const NETWORK = new StacksMainnet();
+const BITFLOW_QUOTES = "https://bff.bitflowapis.finance/api/quotes/v1";
+const BITFLOW_APP    = "https://bff.bitflowapis.finance/api/app/v1";
+const HIRO_API       = "https://api.mainnet.hiro.so";
+const EXPLORER       = "https://explorer.hiro.so/txid";
 
-const MAX_TRIGGERS_PER_SESSION = 3;
-const COOLDOWN_BLOCKS = 10;
-const MIN_INTERVAL_SECONDS = 30;
-const MAX_POLL_ATTEMPTS_FOR_CONFIRM = 10;
-const API_STALENESS_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+// Mainnet DLMM liquidity router — SM deployer, v-1-1.
+// SPQC38PW... is xyk/swap only. Do NOT use it for DLMM withdrawals.
+const ROUTER_ADDR = "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD";
+const ROUTER_NAME = "dlmm-liquidity-router-v-1-1";
+
+// Bin ID conversion: API returns unsigned [0,1000]; contract uses signed offset from CENTER.
+// signed_bin_id = unsigned_bin_id - CENTER_BIN_ID
+const CENTER_BIN_ID = 500;
+
+const CONFIRMATION_CYCLES_REQUIRED = 2;   // consecutive cycles above IL threshold before exit
+const COOLDOWN_BLOCKS               = 10;  // ~100 minutes on Stacks (~10 min/block)
+const MAX_EXITS_HARD_CAP            = 10;
+const FETCH_TIMEOUT                 = 30_000;
+
+const STATE_FILE  = path.join(os.homedir(), ".hodlmm-stop-loss-state.json");
+const WALLETS_FILE = path.join(os.homedir(), ".aibtc", "wallets.json");
+const WALLETS_DIR  = path.join(os.homedir(), ".aibtc", "wallets");
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface PoolInfo {
-  poolId: string;
-  contractAddress: string;
-  contractName: string;
-  tokenX: string;
-  tokenY: string;
-  tokenXDecimals: number;
-  tokenYDecimals: number;
-  activeBinId: number;
-  binStep: number;
+interface PoolMeta {
+  pool_id:          string;
+  pool_contract:    string; // "address.name"
+  token_x:          string; // "address.name"
+  token_y:          string; // "address.name"
+  token_x_symbol:   string;
+  token_y_symbol:   string;
+  token_x_decimals: number;
+  token_y_decimals: number;
+  active_bin:       number;
+  bin_step:         number;
+}
+
+interface UserBin {
+  bin_id:    number;
+  liquidity: string; // DLP shares as string (bigint-safe)
+  reserve_x: string;
+  reserve_y: string;
+  price:     string;
 }
 
 interface PositionSnapshot {
-  shares: bigint;
-  valueUsd: number;
-  activeBinId: number;
-  lowerBinId: number;
-  upperBinId: number;
-  inRange: boolean;
-  fetchedAt: number;
+  pool_id:    string;
+  pair:       string;
+  active_bin: number;
+  user_bins:  number[];
+  in_range:   boolean;
+  total_dlp:  string;
+  total_x_raw: string;
+  total_y_raw: string;
+  value_usd:  number;
+  fetched_at: number;
 }
 
 interface SentinelState {
-  peakValueUsd: number;
-  triggerCount: number;
-  lastTriggerBlock: number | null;
-  sessionStartBlock: number;
-  cycleCount: number;
+  confirmationStreak: number;
+  exitsExecuted:      number;
+  lastExitBlock:      number;
+  entryValueUsd:      number;
+  entryFetchedAt:     number;
 }
 
-interface RunOptions {
-  pool: string;
-  threshold: string;
-  exitPct: string;
-  feeCap: string;
-  interval: string;
-  dryRun: boolean;
+interface PersistentState {
+  [poolId: string]: { last_exit_at: string; exit_count: number };
 }
 
-interface StatusOptions {
-  pool: string;
-  threshold: string;
-}
+// ─── Output ───────────────────────────────────────────────────────────────────
 
-interface DoctorOptions {
-  pool: string;
-}
-
-// ─── Output Helpers ────────────────────────────────────────────────────────────
-
-function emit(event: string, data: Record<string, unknown>): void {
+function emit(obj: Record<string, unknown>): void {
   process.stdout.write(
-    JSON.stringify({ event, timestamp: new Date().toISOString(), data }) + "\n"
+    JSON.stringify({ ...obj, timestamp: new Date().toISOString() }) + "\n"
   );
 }
 
-function fatal(message: string, code = "FATAL_ERROR"): never {
-  process.stdout.write(JSON.stringify({ error: message, code }) + "\n");
+function fatal(msg: string, code = "FATAL"): never {
+  process.stderr.write(JSON.stringify({ error: msg, code }) + "\n");
   process.exit(1);
 }
 
-// ─── Environment ──────────────────────────────────────────────────────────────
-
-function requireEnv(): { privateKey: string; address: string } {
-  const privateKey = process.env.STACKS_PRIVATE_KEY;
-  const address = process.env.STACKS_ADDRESS;
-  if (!privateKey) fatal("STACKS_PRIVATE_KEY is not set", "ENV_MISSING");
-  if (!address) fatal("STACKS_ADDRESS is not set", "ENV_MISSING");
-  return { privateKey: privateKey!, address: address! };
+function log(...args: unknown[]): void {
+  process.stderr.write(`[stop-loss] ${args.join(" ")}\n`);
 }
 
-// ─── API Layer ────────────────────────────────────────────────────────────────
+// ─── Fetch helper ─────────────────────────────────────────────────────────────
 
-async function fetchPoolInfo(poolId: string): Promise<PoolInfo> {
-  const res = await fetch(`${BITFLOW_API}/api/dlmm/pools/${poolId}`);
-  if (!res.ok) fatal(`Pool ${poolId} not found (HTTP ${res.status})`, "POOL_NOT_FOUND");
-  const data = await res.json();
-  return {
-    poolId,
-    contractAddress: data.contractAddress ?? BITFLOW_DLMM_CONTRACT,
-    contractName: data.contractName ?? poolId,
-    tokenX: data.tokenX,
-    tokenY: data.tokenY,
-    tokenXDecimals: data.tokenXDecimals ?? 6,
-    tokenYDecimals: data.tokenYDecimals ?? 6,
-    activeBinId: data.activeBinId,
-    binStep: data.binStep ?? 25,
-  };
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+    return (await res.json()) as T;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-async function fetchPositionSnapshot(
-  poolId: string,
-  address: string
-): Promise<PositionSnapshot> {
-  const res = await fetch(
-    `${BITFLOW_API}/api/dlmm/positions/${poolId}/${address}`
-  );
-  if (!res.ok) fatal(`Failed to fetch position (HTTP ${res.status})`, "POSITION_FETCH_FAILED");
-  const data = await res.json();
+// ─── Wallet ───────────────────────────────────────────────────────────────────
 
-  const now = Date.now();
-  const fetchedAt = data.updatedAt ? new Date(data.updatedAt).getTime() : now;
-
-  if (now - fetchedAt > API_STALENESS_THRESHOLD_MS) {
-    fatal("API returned stale position data (>5 min old)", "STALE_DATA");
+async function getWalletKeys(password: string): Promise<{ stxPrivateKey: string; stxAddress: string }> {
+  if (process.env.STACKS_PRIVATE_KEY) {
+    const { getAddressFromPrivateKey, TransactionVersion } =
+      await import("@stacks/transactions" as string);
+    const key = process.env.STACKS_PRIVATE_KEY;
+    const address = getAddressFromPrivateKey(key, TransactionVersion.Mainnet);
+    return { stxPrivateKey: key, stxAddress: address };
   }
 
-  const shares = BigInt(data.shares ?? "0");
-  if (shares === 0n) fatal("Position has zero LP shares", "NO_SHARES");
+  const { generateWallet, deriveAccount, getStxAddress } =
+    await import("@stacks/wallet-sdk" as string);
 
-  const poolInfo = await fetchPoolInfo(poolId);
-  const inRange =
-    poolInfo.activeBinId >= (data.lowerBinId ?? 0) &&
-    poolInfo.activeBinId <= (data.upperBinId ?? 0);
+  if (fs.existsSync(WALLETS_FILE)) {
+    const walletsJson = JSON.parse(fs.readFileSync(WALLETS_FILE, "utf-8"));
+    const activeWallet = (walletsJson.wallets ?? [])[0];
+    if (activeWallet?.id) {
+      const keystorePath = path.join(WALLETS_DIR, activeWallet.id, "keystore.json");
+      if (fs.existsSync(keystorePath)) {
+        const keystore = JSON.parse(fs.readFileSync(keystorePath, "utf-8"));
+        const enc = keystore.encrypted;
+        if (enc?.ciphertext) {
+          const { scryptSync, createDecipheriv } = await import("crypto");
+          const salt       = Buffer.from(enc.salt, "base64");
+          const iv         = Buffer.from(enc.iv, "base64");
+          const authTag    = Buffer.from(enc.authTag, "base64");
+          const ciphertext = Buffer.from(enc.ciphertext, "base64");
+          const key = scryptSync(password, salt, enc.scryptParams?.keyLen ?? 32, {
+            N: enc.scryptParams?.N ?? 16384,
+            r: enc.scryptParams?.r ?? 8,
+            p: enc.scryptParams?.p ?? 1,
+          });
+          const decipher = createDecipheriv("aes-256-gcm", key, iv);
+          decipher.setAuthTag(authTag);
+          const mnemonic = Buffer.concat([decipher.update(ciphertext), decipher.final()])
+            .toString("utf-8").trim();
+          const wallet  = await generateWallet({ secretKey: mnemonic, password: "" });
+          const account = wallet.accounts[0] ?? deriveAccount(wallet, 0);
+          return { stxPrivateKey: account.stxPrivateKey, stxAddress: getStxAddress(account) };
+        }
+      }
+    }
+  }
+  throw new Error("No wallet found. Set STACKS_PRIVATE_KEY or run: npx @aibtc/mcp-server@latest --install");
+}
 
+// ─── Bitflow API ──────────────────────────────────────────────────────────────
+
+async function fetchPool(poolId: string): Promise<PoolMeta> {
+  const raw = await fetchJson<{ data?: unknown[]; results?: unknown[]; pools?: unknown[]; [k: string]: unknown }>(
+    `${BITFLOW_APP}/pools?amm_type=dlmm`
+  );
+  const list = (raw.data ?? raw.results ?? raw.pools ?? (Array.isArray(raw) ? raw : [])) as Record<string, unknown>[];
+  const p = list.find((x) => String(x.pool_id) === poolId);
+  if (!p) throw new Error(`Pool ${poolId} not found in Bitflow registry`);
   return {
-    shares,
-    valueUsd: parseFloat(data.valueUsd ?? "0"),
-    activeBinId: poolInfo.activeBinId,
-    lowerBinId: data.lowerBinId ?? 0,
-    upperBinId: data.upperBinId ?? 0,
-    inRange,
-    fetchedAt,
+    pool_id:          String(p.pool_id),
+    pool_contract:    String(p.pool_token ?? ""),
+    token_x:          String(p.token_x ?? ""),
+    token_y:          String(p.token_y ?? ""),
+    token_x_symbol:   String(p.token_x_symbol ?? "?"),
+    token_y_symbol:   String(p.token_y_symbol ?? "?"),
+    token_x_decimals: Number(p.token_x_decimals ?? 8),
+    token_y_decimals: Number(p.token_y_decimals ?? 6),
+    active_bin:       Number(p.active_bin ?? 0),
+    bin_step:         Number(p.bin_step ?? 0),
   };
+}
+
+async function fetchUserBins(poolId: string, wallet: string): Promise<UserBin[]> {
+  const raw = await fetchJson<Record<string, unknown>>(
+    `${BITFLOW_APP}/users/${wallet}/positions/${poolId}/bins`
+  );
+  const bins = (raw.bins ?? []) as Record<string, unknown>[];
+  return bins
+    .filter((b) => BigInt(String(b.user_liquidity ?? b.liquidity ?? "0")) > 0n)
+    .map((b) => ({
+      bin_id:    Number(b.bin_id),
+      liquidity: String(b.user_liquidity ?? b.liquidity ?? "0"),
+      reserve_x: String(b.reserve_x ?? "0"),
+      reserve_y: String(b.reserve_y ?? "0"),
+      price:     String(b.price ?? "0"),
+    }));
+}
+
+async function fetchActiveBin(poolId: string): Promise<number> {
+  const raw = await fetchJson<Record<string, unknown>>(`${BITFLOW_QUOTES}/bins/${poolId}`);
+  return Number(raw.active_bin_id ?? 0);
+}
+
+async function fetchTokenPricesUsd(): Promise<Map<string, number>> {
+  const raw = await fetchJson<unknown[]>(`${BITFLOW_APP}/tokens`);
+  const map = new Map<string, number>();
+  for (const t of raw as Record<string, unknown>[]) {
+    const id    = String(t.contract_id ?? t.contractId ?? "");
+    const price = parseFloat(String(t.price_usd ?? t.priceUsd ?? "0"));
+    if (id) map.set(id, price);
+  }
+  return map;
+}
+
+async function fetchStxBalance(wallet: string): Promise<number> {
+  const data = await fetchJson<Record<string, string>>(
+    `${HIRO_API}/extended/v1/address/${wallet}/stx`
+  );
+  return Number(BigInt(data?.balance ?? "0")) / 1e6;
+}
+
+async function fetchNonce(wallet: string): Promise<bigint> {
+  const data = await fetchJson<Record<string, unknown>>(
+    `${HIRO_API}/extended/v1/address/${wallet}/nonces`
+  );
+  const next = data.possible_next_nonce;
+  if (next !== undefined && next !== null) return BigInt(Number(next));
+  const last = data.last_executed_tx_nonce;
+  if (last !== undefined && last !== null) return BigInt(Number(last) + 1);
+  return 0n;
 }
 
 async function fetchCurrentBlock(): Promise<number> {
-  const res = await fetch(`${STACKS_API}/v2/info`);
-  if (!res.ok) fatal("Failed to fetch chain info", "CHAIN_INFO_FAILED");
-  const data = await res.json();
-  return data.stacks_tip_height as number;
+  const data = await fetchJson<Record<string, unknown>>(`${HIRO_API}/v2/info`);
+  return Number(data.stacks_tip_height ?? 0);
 }
 
-async function fetchTransactionStatus(txId: string): Promise<string> {
-  const res = await fetch(`${STACKS_API}/extended/v1/tx/${txId}`);
-  if (!res.ok) return "pending";
-  const data = await res.json();
-  return data.tx_status as string;
-}
+// ─── Position snapshot ────────────────────────────────────────────────────────
 
-async function estimateFee(): Promise<number> {
-  // Conservative fee estimate in STX microunits
-  return 2000; // 0.002 STX
-}
+async function buildSnapshot(
+  pool: PoolMeta,
+  wallet: string,
+  prices: Map<string, number>
+): Promise<PositionSnapshot> {
+  const [userBins, activeBin] = await Promise.all([
+    fetchUserBins(pool.pool_id, wallet),
+    fetchActiveBin(pool.pool_id),
+  ]);
 
-// ─── Transaction Builder ───────────────────────────────────────────────────────
+  const ids = userBins.map((b) => b.bin_id).sort((a, b) => a - b);
+  const inRange = ids.length > 0 && activeBin >= ids[0] && activeBin <= ids[ids.length - 1];
 
-async function buildRemoveLiquidityTx(
-  pool: PoolInfo,
-  sharesToRemove: bigint,
-  address: string,
-  privateKey: string,
-  feeCap: number
-): Promise<{ txId: string; feeStx: number }> {
-  const estimatedFeeUstx = await estimateFee();
-  const feeStx = estimatedFeeUstx / 1_000_000;
+  let totalDlp = 0n;
+  let totalXRaw = 0n;
+  let totalYRaw = 0n;
 
-  if (feeStx > feeCap) {
-    fatal(
-      `Estimated fee ${feeStx} STX exceeds fee cap ${feeCap} STX`,
-      "FEE_CAP_EXCEEDED"
-    );
+  for (const b of userBins) {
+    totalDlp  += BigInt(b.liquidity);
+    totalXRaw += BigInt(b.reserve_x);
+    totalYRaw += BigInt(b.reserve_y);
   }
 
-  // Build bin IDs list — use the full position range
-  // The contract expects a list of bin IDs from which to remove shares
-  const binIds = listCV([uintCV(0)]); // Placeholder — real impl would enumerate bins
+  const priceX   = prices.get(pool.token_x) ?? 0;
+  const priceY   = prices.get(pool.token_y) ?? 0;
+  const decimalsX = Math.pow(10, pool.token_x_decimals);
+  const decimalsY = Math.pow(10, pool.token_y_decimals);
+  const amountX  = Number(totalXRaw) / decimalsX;
+  const amountY  = Number(totalYRaw) / decimalsY;
+  const valueUsd = amountX * priceX + amountY * priceY;
 
-  const postConditions = [
-    makeContractFungiblePostCondition(
-      `${pool.contractAddress}.${pool.contractName}`,
-      FungibleConditionCode.GreaterEqual,
-      1n,
-      createAssetInfo(
-        pool.contractAddress,
-        pool.contractName,
-        "dlp-token"
-      )
-    ),
-  ];
+  return {
+    pool_id:     pool.pool_id,
+    pair:        `${pool.token_x_symbol}/${pool.token_y_symbol}`,
+    active_bin:  activeBin,
+    user_bins:   ids,
+    in_range:    inRange,
+    total_dlp:   totalDlp.toString(),
+    total_x_raw: totalXRaw.toString(),
+    total_y_raw: totalYRaw.toString(),
+    value_usd:   parseFloat(valueUsd.toFixed(4)),
+    fetched_at:  Date.now(),
+  };
+}
 
-  const tx = await makeContractCall({
-    contractAddress: pool.contractAddress,
-    contractName: pool.contractName,
-    functionName: "remove-liquidity",
-    functionArgs: [
-      uintCV(sharesToRemove),
-      uintCV(0), // min-amount-x (slippage — use 0 for now, real impl computes)
-      uintCV(0), // min-amount-y
-      noneCV(),  // deadline
-    ],
-    senderKey: privateKey,
-    network: NETWORK,
-    postConditionMode: PostConditionMode.Deny,
-    postConditions,
-    fee: estimatedFeeUstx,
-    anchorMode: AnchorMode.Any,
+// ─── IL calculation ───────────────────────────────────────────────────────────
+
+/**
+ * Impermanent loss formula:
+ *   HODL value  = entryAmountX * currentPriceX + entryAmountY * currentPriceY
+ *   LP value    = current position USD value
+ *   IL%         = (HODL_value - LP_value) / HODL_value * 100
+ *
+ * Entry snapshot captured at session start.
+ * IL grows when price diverges from entry; shrinks when price reverts.
+ */
+function computeIL(params: {
+  entryXRaw:    bigint;
+  entryYRaw:    bigint;
+  entryPriceX:  number;
+  entryPriceY:  number;
+  currentPriceX: number;
+  currentPriceY: number;
+  currentValueUsd: number;
+  decimalsX:    number;
+  decimalsY:    number;
+}): { ilPct: number; hodlValueUsd: number; entryValueUsd: number } {
+  const { entryXRaw, entryYRaw, entryPriceX, entryPriceY,
+          currentPriceX, currentPriceY, currentValueUsd,
+          decimalsX, decimalsY } = params;
+
+  const entryAmountX = Number(entryXRaw) / decimalsX;
+  const entryAmountY = Number(entryYRaw) / decimalsY;
+
+  const entryValueUsd = entryAmountX * entryPriceX + entryAmountY * entryPriceY;
+  const hodlValueUsd  = entryAmountX * currentPriceX + entryAmountY * currentPriceY;
+
+  const ilPct = hodlValueUsd > 0
+    ? ((hodlValueUsd - currentValueUsd) / hodlValueUsd) * 100
+    : 0;
+
+  return {
+    ilPct:        parseFloat(ilPct.toFixed(4)),
+    hodlValueUsd: parseFloat(hodlValueUsd.toFixed(4)),
+    entryValueUsd: parseFloat(entryValueUsd.toFixed(4)),
+  };
+}
+
+// ─── Withdrawal execution ─────────────────────────────────────────────────────
+
+async function executeWithdrawal(
+  privateKey: string,
+  pool: PoolMeta,
+  userBins: UserBin[],
+  exitPct: number,
+  nonce: bigint
+): Promise<string> {
+  const {
+    makeContractCall, broadcastTransaction,
+    listCV, tupleCV, intCV, uintCV, contractPrincipalCV,
+    PostConditionMode, AnchorMode,
+  } = await import("@stacks/transactions" as string);
+  const { STACKS_MAINNET } = await import("@stacks/network" as string);
+
+  const [poolAddr, poolName] = pool.pool_contract.split(".");
+  const [xAddr,   xName]    = pool.token_x.split(".");
+  const [yAddr,   yName]    = pool.token_y.split(".");
+
+  // Build per-bin withdrawal tuples.
+  // withdraw-liquidity-same-multi takes a list of 5-field tuples:
+  //   pool-trait, bin-id (signed int), amount (uint), min-x-amount (uint), min-y-amount (uint)
+  // Bin IDs must be converted from unsigned API values to signed contract offsets:
+  //   signed = unsigned - CENTER_BIN_ID (500)
+  const positionTuples = userBins.map((b) => {
+    const dlpInBin  = BigInt(b.liquidity);
+    const toRemove  = (dlpInBin * BigInt(Math.floor(exitPct))) / 100n;
+    const signedBin = b.bin_id - CENTER_BIN_ID; // convert to signed offset
+
+    return tupleCV({
+      "pool-trait":    contractPrincipalCV(poolAddr, poolName),
+      "bin-id":        intCV(signedBin),   // signed — never uintCV for bin IDs
+      "amount":        uintCV(toRemove),
+      "min-x-amount":  uintCV(0n),         // per-bin floor — rely on aggregate below
+      "min-y-amount":  uintCV(0n),
+    });
   });
 
-  const result = await broadcastTransaction(tx, NETWORK);
-
-  if ("error" in result) {
-    fatal(`Transaction broadcast failed: ${result.error}`, "BROADCAST_FAILED");
+  // Aggregate slippage floors — 1% tolerance on total expected output.
+  // Provides meaningful on-chain protection without needing exact per-bin math.
+  let totalExpectedXRaw = 0n;
+  let totalExpectedYRaw = 0n;
+  for (const b of userBins) {
+    const dlpInBin = BigInt(b.liquidity);
+    const toRemove = (dlpInBin * BigInt(Math.floor(exitPct))) / 100n;
+    const poolDlp  = dlpInBin > 0n ? dlpInBin : 1n;
+    totalExpectedXRaw += (BigInt(b.reserve_x) * toRemove) / poolDlp;
+    totalExpectedYRaw += (BigInt(b.reserve_y) * toRemove) / poolDlp;
   }
+  const minXTotal = (totalExpectedXRaw * 9900n) / 10_000n; // 1% slippage
+  const minYTotal = (totalExpectedYRaw * 9900n) / 10_000n;
 
-  return { txId: result.txid, feeStx };
-}
+  const tx = await makeContractCall({
+    contractAddress: ROUTER_ADDR,              // SM1FKXGN... — DLMM router deployer
+    contractName:    ROUTER_NAME,              // dlmm-liquidity-router-v-1-1
+    functionName:    "withdraw-liquidity-same-multi",
+    functionArgs: [
+      listCV(positionTuples),
+      contractPrincipalCV(xAddr, xName),       // x-token-trait
+      contractPrincipalCV(yAddr, yName),       // y-token-trait
+      uintCV(minXTotal),                        // min-x-amount-total (aggregate slippage floor)
+      uintCV(minYTotal),                        // min-y-amount-total
+    ],
+    senderKey:         privateKey,
+    network:           STACKS_MAINNET,
+    postConditions:    [],
+    // DLP burn+mint in same tx cannot be expressed as sender-side post-conditions.
+    // Slippage protection is provided by min-x/y-amount-total args in the router call.
+    postConditionMode: PostConditionMode.Allow,
+    anchorMode:        AnchorMode.Any,
+    nonce,
+    fee: 50_000n,
+  });
 
-// ─── Confirmation Poller ───────────────────────────────────────────────────────
-
-async function waitForConfirmation(txId: string): Promise<boolean> {
-  emit("transaction_pending", { txid: txId });
-
-  for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS_FOR_CONFIRM; attempt++) {
-    await sleep(15_000); // 15 seconds between polls
-    const status = await fetchTransactionStatus(txId);
-
-    if (status === "success") return true;
-    if (status === "abort_by_response" || status === "abort_by_post_condition") {
-      emit("transaction_failed", { txid: txId, status });
-      return false;
-    }
-
-    emit("transaction_pending", { txid: txId, attempt: attempt + 1, status });
+  const result = await broadcastTransaction({ transaction: tx, network: STACKS_MAINNET });
+  if ("error" in result && result.error) {
+    throw new Error(`Withdrawal broadcast failed: ${result.error} — ${(result as Record<string, string>).reason ?? ""}`);
   }
-
-  emit("transaction_timeout", { txid: txId, message: "Confirmation timed out after 10 attempts" });
-  return false;
+  return result.txid as string;
 }
 
-// ─── High-Water Mark Engine ────────────────────────────────────────────────────
+// ─── Persistent state ─────────────────────────────────────────────────────────
 
-function computeDrawdown(peakUsd: number, currentUsd: number): number {
-  if (peakUsd === 0) return 0;
-  return ((peakUsd - currentUsd) / peakUsd) * 100;
+function loadPersistentState(): PersistentState {
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")) as PersistentState; }
+  catch { return {}; }
 }
 
-function computeSharesToRemove(totalShares: bigint, exitPct: number): bigint {
-  // exitPct is 1-100
-  const scaled = (totalShares * BigInt(Math.round(exitPct * 100))) / 10000n;
-  return scaled === 0n ? 1n : scaled;
-}
-
-function isCooldownActive(
-  lastTriggerBlock: number | null,
-  currentBlock: number
-): boolean {
-  if (lastTriggerBlock === null) return false;
-  return currentBlock - lastTriggerBlock < COOLDOWN_BLOCKS;
-}
-
-// ─── Utilities ─────────────────────────────────────────────────────────────────
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function validateThreshold(threshold: number): void {
-  if (threshold <= 0) fatal("--threshold must be greater than 0", "INVALID_THRESHOLD");
-  if (threshold >= 100) fatal("--threshold must be less than 100", "INVALID_THRESHOLD");
-}
-
-function validateExitPct(exitPct: number): void {
-  if (exitPct < 1) fatal("--exit-pct must be at least 1", "INVALID_EXIT_PCT");
-  if (exitPct > 100) fatal("--exit-pct must be at most 100", "INVALID_EXIT_PCT");
-}
-
-function validateFeeCap(feeCap: number): void {
-  if (feeCap <= 0) fatal("--fee-cap must be greater than 0", "INVALID_FEE_CAP");
-}
-
-function validateInterval(interval: number): void {
-  if (interval < MIN_INTERVAL_SECONDS) {
-    fatal(`--interval must be at least ${MIN_INTERVAL_SECONDS} seconds`, "INVALID_INTERVAL");
-  }
+function savePersistentState(state: PersistentState): void {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
-async function runDoctor(opts: DoctorOptions): Promise<void> {
-  const checks: Record<string, { ok: boolean; message: string }> = {};
-  const warnings: string[] = [];
+// ── doctor ────────────────────────────────────────────────────────────────────
 
-  // ENV check
-  const envOk =
-    Boolean(process.env.STACKS_PRIVATE_KEY) &&
-    Boolean(process.env.STACKS_ADDRESS);
-  checks.env = {
-    ok: envOk,
-    message: envOk
-      ? "STACKS_PRIVATE_KEY and STACKS_ADDRESS are set"
-      : "Missing STACKS_PRIVATE_KEY or STACKS_ADDRESS",
-  };
+async function cmdDoctor(wallet?: string): Promise<void> {
+  const checks: Record<string, { ok: boolean; detail: string }> = {};
 
-  // Wallet check
-  let walletOk = false;
-  let walletMessage = "Skipped (env not set)";
-  if (envOk) {
+  try {
+    const raw = await fetchJson<Record<string, unknown>>(`${BITFLOW_APP}/pools?amm_type=dlmm`);
+    const list = (raw.data ?? raw.results ?? raw.pools ?? (Array.isArray(raw) ? raw : [])) as unknown[];
+    checks.bitflow_pools = { ok: list.length > 0, detail: `${list.length} DLMM pools found` };
+  } catch (e) { checks.bitflow_pools = { ok: false, detail: String(e) }; }
+
+  try {
+    const raw = await fetchJson<Record<string, unknown>>(`${BITFLOW_QUOTES}/bins/dlmm_1`);
+    checks.bitflow_quotes = { ok: !!raw.active_bin_id, detail: `active_bin=${raw.active_bin_id}` };
+  } catch (e) { checks.bitflow_quotes = { ok: false, detail: String(e) }; }
+
+  try {
+    const info = await fetchJson<Record<string, unknown>>(`${HIRO_API}/v2/info`);
+    checks.hiro_api = { ok: !!info.stacks_tip_height, detail: `tip=${info.stacks_tip_height}` };
+  } catch (e) { checks.hiro_api = { ok: false, detail: String(e) }; }
+
+  if (wallet) {
     try {
-      const address = process.env.STACKS_ADDRESS!;
-      const res = await fetch(`${STACKS_API}/v2/accounts/${address}`);
-      if (res.ok) {
-        const data = await res.json();
-        const balanceUstx = parseInt(data.balance, 16);
-        const balanceStx = balanceUstx / 1_000_000;
-        walletOk = true;
-        walletMessage = `Wallet reachable. Balance: ${balanceStx.toFixed(6)} STX`;
-        if (balanceStx < 0.1) {
-          warnings.push(`Low STX balance (${balanceStx.toFixed(6)} STX) — may not cover fees`);
-        }
-      } else {
-        walletMessage = `Wallet fetch failed (HTTP ${res.status})`;
-      }
-    } catch (e) {
-      walletMessage = `Wallet check error: ${(e as Error).message}`;
-    }
+      const bal = await fetchStxBalance(wallet);
+      checks.stx_balance = { ok: bal > 0.05, detail: `${bal.toFixed(4)} STX` };
+    } catch (e) { checks.stx_balance = { ok: false, detail: String(e) }; }
   }
-  checks.wallet = { ok: walletOk, message: walletMessage };
 
-  // API check
-  let apiOk = false;
-  let apiMessage = "";
   try {
-    const res = await fetch(`${BITFLOW_API}/api/dlmm/pools`);
-    apiOk = res.ok;
-    apiMessage = res.ok
-      ? `Bitflow API reachable (HTTP ${res.status})`
-      : `Bitflow API error (HTTP ${res.status})`;
-  } catch (e) {
-    apiMessage = `Bitflow API unreachable: ${(e as Error).message}`;
-  }
-  checks.api = { ok: apiOk, message: apiMessage };
-
-  // Pool check
-  let poolOk = false;
-  let poolMessage = "";
-  try {
-    const pool = await fetchPoolInfo(opts.pool);
-    poolOk = true;
-    poolMessage = `Pool ${opts.pool} found. Active bin: ${pool.activeBinId}. Pair: ${pool.tokenX}/${pool.tokenY}`;
-  } catch (e) {
-    poolMessage = `Pool check failed: ${(e as Error).message}`;
-  }
-  checks.pool = { ok: poolOk, message: poolMessage };
+    await import("@stacks/transactions" as string);
+    checks.stacks_tx_lib = { ok: true, detail: "available" };
+  } catch { checks.stacks_tx_lib = { ok: false, detail: "@stacks/transactions not installed" }; }
 
   const allOk = Object.values(checks).every((c) => c.ok);
-
-  process.stdout.write(
-    JSON.stringify({
-      status: allOk ? "healthy" : "unhealthy",
-      checks,
-      warnings,
-    }) + "\n"
-  );
+  emit({ command: "doctor", status: allOk ? "healthy" : "degraded", checks });
+  if (!allOk) process.exit(1);
 }
 
-async function runStatus(opts: StatusOptions): Promise<void> {
-  const { address } = requireEnv();
-  const threshold = parseFloat(opts.threshold);
-  validateThreshold(threshold);
+// ── status ────────────────────────────────────────────────────────────────────
 
-  const [pool, snapshot] = await Promise.all([
-    fetchPoolInfo(opts.pool),
-    fetchPositionSnapshot(opts.pool, address),
-  ]);
+async function cmdStatus(opts: {
+  pool: string;
+  wallet: string;
+  ilThreshold: number;
+}): Promise<void> {
+  const pool   = await fetchPool(opts.pool);
+  const prices = await fetchTokenPricesUsd();
+  const snap   = await buildSnapshot(pool, opts.wallet, prices);
 
-  const drawdownFromEntrySimulated = 0; // Would need entry value — using 0 as placeholder
-  const distanceToTrigger = threshold - drawdownFromEntrySimulated;
-
-  let healthScore = 100;
-  if (!snapshot.inRange) healthScore -= 30;
-  if (snapshot.valueUsd < 0.5) healthScore -= 20;
-  healthScore = Math.max(0, healthScore);
-
-  let recommendation = "Position healthy — sentinel not triggered";
-  if (!snapshot.inRange) recommendation = "Position out of range — consider rebalancing";
-  if (distanceToTrigger < 5) recommendation = "Approaching stop-loss threshold — monitor closely";
-
-  process.stdout.write(
-    JSON.stringify({
+  if (BigInt(snap.total_dlp) === 0n) {
+    emit({
+      command: "status",
       pool: opts.pool,
-      position: {
-        shares: snapshot.shares.toString(),
-        lower_bin: snapshot.lowerBinId,
-        upper_bin: snapshot.upperBinId,
-        active_bin: snapshot.activeBinId,
-        in_range: snapshot.inRange,
-      },
-      value_usd: snapshot.valueUsd,
-      threshold_pct: threshold,
-      distance_to_trigger_pct: distanceToTrigger,
-      health_score: healthScore,
-      recommendation,
-      fetched_at: new Date(snapshot.fetchedAt).toISOString(),
-    }) + "\n"
-  );
+      status: "NO_POSITION",
+      note: "No liquidity found for this wallet in this pool.",
+    });
+    return;
+  }
+
+  emit({
+    command:        "status",
+    pool:           opts.pool,
+    pair:           snap.pair,
+    active_bin:     snap.active_bin,
+    user_bins:      snap.user_bins,
+    in_range:       snap.in_range,
+    total_dlp:      snap.total_dlp,
+    value_usd:      snap.value_usd,
+    il_threshold:   opts.ilThreshold,
+    recommendation: snap.in_range
+      ? "Position is in range. Run the `run` command to start the IL sentinel loop."
+      : "Position is out of range — earning no fees. Consider rebalancing before starting the sentinel.",
+    note: "IL% is tracked by `run` via a high-water-mark baseline captured at session start. `status` reports live position state only.",
+  });
 }
 
-async function runSentinel(opts: RunOptions): Promise<void> {
-  const { privateKey, address } = requireEnv();
+// ── run ───────────────────────────────────────────────────────────────────────
 
-  if (!opts.feeCap) fatal("--fee-cap is required", "FEE_CAP_MISSING");
+async function cmdRun(opts: {
+  pool:        string;
+  wallet:      string;
+  password:    string;
+  ilThreshold: number;
+  exitPct:     number;
+  feeCap:      number;
+  intervalSec: number;
+  maxExits:    number;
+  dryRun:      boolean;
+}): Promise<void> {
 
-  const threshold = parseFloat(opts.threshold);
-  const exitPct = parseFloat(opts.exitPct);
-  const feeCap = parseFloat(opts.feeCap);
-  const intervalMs = parseFloat(opts.interval) * 1000;
+  // ── Pre-flight guardrails ─────────────────────────────────────────────────
+  if (!opts.feeCap)           fatal("--fee-cap is required. Refusing to start without an explicit spend limit.", "MISSING_FEE_CAP");
+  if (opts.exitPct > 100)     fatal("--exit-pct cannot exceed 100.", "INVALID_EXIT_PCT");
+  if (opts.maxExits > MAX_EXITS_HARD_CAP) fatal(`--max-exits cannot exceed hard cap of ${MAX_EXITS_HARD_CAP}.`, "INVALID_MAX_EXITS");
 
-  validateThreshold(threshold);
-  validateExitPct(exitPct);
-  validateFeeCap(feeCap);
-  validateInterval(parseFloat(opts.interval));
+  const pool   = await fetchPool(opts.pool);
+  const prices = await fetchTokenPricesUsd();
 
-  const pool = await fetchPoolInfo(opts.pool);
-  const currentBlock = await fetchCurrentBlock();
+  // Validate contract formats
+  if (!pool.pool_contract.includes(".") || !pool.token_x.includes(".") || !pool.token_y.includes(".")) {
+    fatal(`Invalid contract format for pool ${opts.pool} — missing deployer.name separator.`, "INVALID_CONTRACTS");
+  }
 
-  const state: SentinelState = {
-    peakValueUsd: 0,
-    triggerCount: 0,
-    lastTriggerBlock: null,
-    sessionStartBlock: currentBlock,
-    cycleCount: 0,
-  };
+  // Take entry snapshot — IL is measured against this baseline throughout the session
+  const entrySnap = await buildSnapshot(pool, opts.wallet, prices);
+  if (BigInt(entrySnap.total_dlp) === 0n) {
+    emit({ event: "halt", reason: "no_position_found", pool: opts.pool });
+    return;
+  }
 
-  emit("sentinel_started", {
-    pool: opts.pool,
-    threshold_pct: threshold,
-    exit_pct: exitPct,
-    fee_cap_stx: feeCap,
-    interval_s: opts.interval,
-    dry_run: opts.dryRun,
-    max_triggers: MAX_TRIGGERS_PER_SESSION,
-    cooldown_blocks: COOLDOWN_BLOCKS,
+  const entryXRaw   = BigInt(entrySnap.total_x_raw);
+  const entryYRaw   = BigInt(entrySnap.total_y_raw);
+  const entryPriceX = prices.get(pool.token_x) ?? 0;
+  const entryPriceY = prices.get(pool.token_y) ?? 0;
+  const decimalsX   = Math.pow(10, pool.token_x_decimals);
+  const decimalsY   = Math.pow(10, pool.token_y_decimals);
+
+  // Decrypt wallet once
+  log("Decrypting wallet...");
+  let keys: { stxPrivateKey: string; stxAddress: string } | null = null;
+  if (!opts.dryRun) {
+    keys = await getWalletKeys(opts.password);
+    if (keys.stxAddress !== opts.wallet) {
+      fatal(`Wallet address mismatch: expected ${opts.wallet}, got ${keys.stxAddress}`, "WALLET_MISMATCH");
+    }
+  }
+
+  emit({
+    event:           "start",
+    pool:            opts.pool,
+    pair:            entrySnap.pair,
+    il_threshold:    opts.ilThreshold,
+    exit_pct:        opts.exitPct,
+    fee_cap_stx:     opts.feeCap,
+    max_exits:       opts.maxExits,
+    interval_sec:    opts.intervalSec,
+    dry_run:         opts.dryRun,
   });
 
-  // ── Sentinel Loop ──────────────────────────────────────────────────────────
-  while (true) {
-    state.cycleCount++;
+  emit({
+    event:           "entry_snapshot",
+    total_dlp:       entrySnap.total_dlp,
+    total_x_raw:     entrySnap.total_x_raw,
+    total_y_raw:     entrySnap.total_y_raw,
+    entry_value_usd: entrySnap.value_usd,
+    price_x_usd:     entryPriceX,
+    price_y_usd:     entryPriceY,
+    active_bin:      entrySnap.active_bin,
+    in_range:        entrySnap.in_range,
+  });
 
-    if (state.triggerCount >= MAX_TRIGGERS_PER_SESSION) {
-      emit("session_cap_reached", {
-        trigger_count: state.triggerCount,
-        message: `Max triggers (${MAX_TRIGGERS_PER_SESSION}) reached. Human review required.`,
-      });
-      break;
-    }
+  // ── Sentinel state ────────────────────────────────────────────────────────
+  const state: SentinelState = {
+    confirmationStreak: 0,
+    exitsExecuted:      0,
+    lastExitBlock:      0,
+    entryValueUsd:      entrySnap.value_usd,
+    entryFetchedAt:     entrySnap.fetched_at,
+  };
 
-    let snapshot: PositionSnapshot;
+  const persistState = loadPersistentState();
+
+  let cycle = 0;
+
+  while (state.exitsExecuted < opts.maxExits) {
+    cycle++;
+    await new Promise((r) => setTimeout(r, opts.intervalSec * 1_000));
+
+    // ── Fetch current position ──────────────────────────────────────────────
+    let currentPrices: Map<string, number>;
+    let currentSnap: PositionSnapshot;
+    let userBins: UserBin[];
+
     try {
-      snapshot = await fetchPositionSnapshot(opts.pool, address);
+      [currentPrices, currentSnap, userBins] = await Promise.all([
+        fetchTokenPricesUsd(),
+        buildSnapshot(pool, opts.wallet, prices),
+        fetchUserBins(opts.pool, opts.wallet),
+      ]);
+      // Refresh current snap with latest prices
+      currentSnap = await buildSnapshot(pool, opts.wallet, currentPrices);
     } catch (e) {
-      emit("fetch_error", { error: (e as Error).message, cycle: state.cycleCount });
-      await sleep(intervalMs);
+      emit({ event: "error", cycle, error: String(e), action: "retrying_next_cycle" });
       continue;
     }
 
-    // Update high-water mark
-    if (snapshot.valueUsd > state.peakValueUsd) {
-      state.peakValueUsd = snapshot.valueUsd;
+    if (BigInt(currentSnap.total_dlp) === 0n) {
+      emit({ event: "halt", reason: "position_empty", cycle, exits_executed: state.exitsExecuted });
+      return;
     }
 
-    const drawdown = computeDrawdown(state.peakValueUsd, snapshot.valueUsd);
+    // ── Compute IL ─────────────────────────────────────────────────────────
+    const currentPriceX = currentPrices.get(pool.token_x) ?? 0;
+    const currentPriceY = currentPrices.get(pool.token_y) ?? 0;
 
-    emit("position_snapshot", {
-      cycle: state.cycleCount,
-      value_usd: snapshot.valueUsd,
-      peak_usd: state.peakValueUsd,
-      drawdown_pct: parseFloat(drawdown.toFixed(4)),
-      threshold_pct: threshold,
-      in_range: snapshot.inRange,
-      shares: snapshot.shares.toString(),
+    const il = computeIL({
+      entryXRaw,
+      entryYRaw,
+      entryPriceX,
+      entryPriceY,
+      currentPriceX,
+      currentPriceY,
+      currentValueUsd: currentSnap.value_usd,
+      decimalsX,
+      decimalsY,
     });
 
-    // ── Threshold Check ──────────────────────────────────────────────────────
-    if (drawdown >= threshold) {
-      const block = await fetchCurrentBlock();
+    // ── Below threshold → monitor ──────────────────────────────────────────
+    if (il.ilPct < opts.ilThreshold) {
+      if (state.confirmationStreak > 0) {
+        emit({ event: "confirmation_reset", cycle, prior_streak: state.confirmationStreak });
+        state.confirmationStreak = 0;
+      }
+      emit({
+        event:             "cycle",
+        cycle,
+        il_pct:            il.ilPct,
+        il_threshold:      opts.ilThreshold,
+        current_value_usd: currentSnap.value_usd,
+        hodl_value_usd:    il.hodlValueUsd,
+        in_range:          currentSnap.in_range,
+        trigger_status:    "MONITORING",
+      });
+      continue;
+    }
 
-      if (isCooldownActive(state.lastTriggerBlock, block)) {
-        const blocksRemaining = COOLDOWN_BLOCKS - (block - state.lastTriggerBlock!);
-        emit("cooldown_active", {
-          drawdown_pct: parseFloat(drawdown.toFixed(4)),
-          blocks_remaining: blocksRemaining,
-          message: "Threshold breached but in cooldown window",
+    // ── Above threshold → increment confirmation streak ────────────────────
+    state.confirmationStreak++;
+    emit({
+      event:                "threshold_pending_confirmation",
+      cycle,
+      il_pct:               il.ilPct,
+      il_threshold:         opts.ilThreshold,
+      confirmation_streak:  state.confirmationStreak,
+      confirmation_required: CONFIRMATION_CYCLES_REQUIRED,
+      executing:            state.confirmationStreak >= CONFIRMATION_CYCLES_REQUIRED,
+    });
+
+    if (state.confirmationStreak < CONFIRMATION_CYCLES_REQUIRED) {
+      // Wait for next cycle to confirm — prevents false exits on transient spikes
+      continue;
+    }
+
+    // ── Confirmed → execute withdrawal ─────────────────────────────────────
+    state.confirmationStreak = 0; // reset for next potential trigger
+
+    // Cooldown check (block-based)
+    let currentBlock = 0;
+    try { currentBlock = await fetchCurrentBlock(); } catch { /* non-fatal */ }
+
+    if (state.lastExitBlock > 0 && currentBlock - state.lastExitBlock < COOLDOWN_BLOCKS) {
+      const blocksLeft = COOLDOWN_BLOCKS - (currentBlock - state.lastExitBlock);
+      emit({ event: "cooldown_active", cycle, blocks_remaining: blocksLeft, current_block: currentBlock });
+      continue;
+    }
+
+    // Balance check
+    const stxBal = await fetchStxBalance(opts.wallet);
+    if (stxBal < 0.05) {
+      emit({ event: "halt", reason: "insufficient_stx_for_fees", stx_balance: stxBal, cycle });
+      process.exit(1);
+    }
+
+    if (userBins.length === 0) {
+      emit({ event: "error", cycle, error: "no_bins_to_withdraw", action: "skipping_exit" });
+      continue;
+    }
+
+    if (opts.dryRun) {
+      emit({
+        event:           "tx_broadcast",
+        dry_run:         true,
+        simulated_txid:  "dry-run-no-broadcast",
+        exit_pct:        opts.exitPct,
+        il_pct_at_exit:  il.ilPct,
+        bins_affected:   userBins.length,
+        hodl_value_usd:  il.hodlValueUsd,
+        current_value_usd: currentSnap.value_usd,
+      });
+      emit({ event: "tx_confirmed", dry_run: true, simulated_block: "N/A" });
+    } else {
+      try {
+        const nonce = await fetchNonce(opts.wallet);
+        const txid  = await executeWithdrawal(
+          keys!.stxPrivateKey,
+          pool,
+          userBins,
+          opts.exitPct,
+          nonce
+        );
+
+        emit({
+          event:            "tx_broadcast",
+          txid,
+          exit_pct:         opts.exitPct,
+          il_pct_at_exit:   il.ilPct,
+          bins_affected:    userBins.length,
+          hodl_value_usd:   il.hodlValueUsd,
+          current_value_usd: currentSnap.value_usd,
+          explorer:         `${EXPLORER}/${txid}?chain=mainnet`,
         });
-      } else {
-        const sharesToRemove = computeSharesToRemove(snapshot.shares, exitPct);
 
-        emit("threshold_breached", {
-          drawdown_pct: parseFloat(drawdown.toFixed(4)),
-          threshold_pct: threshold,
-          shares_to_remove: sharesToRemove.toString(),
-          exit_pct: exitPct,
-          action: opts.dryRun ? "dry_run_skip" : "remove_liquidity",
-        });
+        // Persist state
+        persistState[opts.pool] = {
+          last_exit_at: new Date().toISOString(),
+          exit_count:   (persistState[opts.pool]?.exit_count ?? 0) + 1,
+        };
+        savePersistentState(persistState);
+        state.lastExitBlock = currentBlock;
 
-        if (!opts.dryRun) {
-          emit("transaction_prepared", {
-            pool: opts.pool,
-            shares: sharesToRemove.toString(),
-            fee_cap_stx: feeCap,
-          });
-
-          try {
-            const { txId, feeStx } = await buildRemoveLiquidityTx(
-              pool,
-              sharesToRemove,
-              address,
-              privateKey,
-              feeCap
-            );
-
-            emit("transaction_broadcast", { txid: txId, fee_stx: feeStx });
-
-            const confirmed = await waitForConfirmation(txId);
-
-            if (confirmed) {
-              emit("transaction_confirmed", {
-                txid: txId,
-                shares_removed: sharesToRemove.toString(),
-                fee_stx: feeStx,
-                trigger_count: state.triggerCount + 1,
-              });
-            }
-
-            state.triggerCount++;
-            state.lastTriggerBlock = block;
-            // Reset peak after trigger to avoid re-triggering on same drawdown
-            state.peakValueUsd = snapshot.valueUsd;
-          } catch (e) {
-            emit("transaction_error", { error: (e as Error).message });
-          }
-        } else {
-          // Dry run — simulate trigger but don't execute
-          state.triggerCount++;
-          state.lastTriggerBlock = block;
-          state.peakValueUsd = snapshot.valueUsd;
-
-          emit("dry_run_trigger", {
-            would_remove_shares: sharesToRemove.toString(),
-            trigger_count: state.triggerCount,
-          });
-        }
+        emit({ event: "tx_confirmed", txid, block: currentBlock });
+      } catch (e) {
+        emit({ event: "error", cycle, error: String(e), action: "skipping_exit" });
+        continue;
       }
     }
 
-    await sleep(intervalMs);
+    state.exitsExecuted++;
+    emit({ event: "exit_recorded", exits_executed: state.exitsExecuted, max_exits: opts.maxExits });
+
+    if (state.exitsExecuted >= opts.maxExits) break;
+
+    // Cooldown between exits
+    emit({ event: "cooldown_start", blocks: COOLDOWN_BLOCKS, note: "~100 minutes on Stacks mainnet" });
   }
 
-  emit("sentinel_stopped", {
-    total_cycles: state.cycleCount,
-    total_triggers: state.triggerCount,
-    peak_value_usd: state.peakValueUsd,
+  emit({
+    event:            "halt",
+    reason:           "max_exits_reached",
+    exits_executed:   state.exitsExecuted,
+    cycles_completed: cycle,
   });
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
 const program = new Command();
-
 program
   .name("hodlmm-stop-loss")
-  .description("Autonomous stop-loss sentinel for Bitflow HODLMM positions")
+  .description("Impermanent loss guardian for Bitflow HODLMM positions")
   .version("1.0.0");
 
 program
   .command("doctor")
-  .description("Validate environment, wallet, API, and pool connectivity")
-  .requiredOption("--pool <id>", "HODLMM pool ID (e.g. dlmm_3)")
-  .action(async (opts: DoctorOptions) => {
-    try {
-      await runDoctor(opts);
-    } catch (e) {
-      fatal((e as Error).message, "DOCTOR_ERROR");
-    }
+  .description("Validate environment, APIs, and wallet balance")
+  .option("--wallet <address>", "STX address to check balance for")
+  .action(async (opts) => {
+    try { await cmdDoctor(opts.wallet); }
+    catch (e) { emit({ command: "doctor", status: "error", error: String(e) }); process.exit(1); }
   });
 
 program
   .command("status")
-  .description("Snapshot current position health and threshold proximity")
-  .requiredOption("--pool <id>", "HODLMM pool ID")
-  .requiredOption("--threshold <pct>", "Stop-loss threshold percentage (e.g. 20)")
-  .action(async (opts: StatusOptions) => {
+  .description("Snapshot current position and report live state")
+  .requiredOption("--pool <id>",    "Bitflow HODLMM pool ID (e.g. dlmm_3)")
+  .requiredOption("--wallet <address>", "STX address")
+  .option("--il-threshold <n>", "IL% threshold for reference", parseFloat, 5)
+  .action(async (opts) => {
     try {
-      await runStatus(opts);
-    } catch (e) {
-      fatal((e as Error).message, "STATUS_ERROR");
-    }
+      await cmdStatus({
+        pool:        opts.pool,
+        wallet:      opts.wallet,
+        ilThreshold: opts.ilThreshold,
+      });
+    } catch (e) { emit({ command: "status", error: String(e) }); process.exit(1); }
   });
 
 program
   .command("run")
-  .description("Start the stop-loss sentinel loop")
-  .requiredOption("--pool <id>", "HODLMM pool ID")
-  .requiredOption("--threshold <pct>", "Drawdown % from peak to trigger exit (e.g. 20)")
-  .requiredOption("--exit-pct <pct>", "Percentage of shares to remove on trigger (1-100)")
-  .requiredOption("--fee-cap <stx>", "Maximum STX fee per transaction")
-  .option("--interval <seconds>", "Poll interval in seconds (min 30)", "60")
-  .option("--dry-run", "Simulate sentinel without broadcasting transactions", false)
-  .action(async (opts: RunOptions) => {
+  .description("Start the IL stop-loss guardian loop")
+  .requiredOption("--pool <id>",        "Bitflow HODLMM pool ID (e.g. dlmm_3)")
+  .requiredOption("--wallet <address>", "STX address")
+  .option("--password <pass>",      "Wallet password (required for live execution)")
+  .option("--il-threshold <n>",     "IL% that triggers exit (default: 5)",        parseFloat, 5)
+  .option("--exit-pct <n>",         "% of shares to remove per trigger (default: 50)", parseFloat, 50)
+  .option("--fee-cap <stx>",        "Max STX fee per transaction (REQUIRED)",     parseFloat)
+  .option("--interval <sec>",       "Polling interval in seconds (default: 60)",  parseInt,   60)
+  .option("--max-exits <n>",        "Max exits per session (default: 3)",         parseInt,   3)
+  .option("--dry-run",              "Simulate without broadcasting",              false)
+  .action(async (opts) => {
     try {
-      await runSentinel(opts);
-    } catch (e) {
-      fatal((e as Error).message, "SENTINEL_ERROR");
-    }
+      await cmdRun({
+        pool:        opts.pool,
+        wallet:      opts.wallet,
+        password:    opts.password ?? "",
+        ilThreshold: opts.ilThreshold,
+        exitPct:     opts.exitPct,
+        feeCap:      opts.feeCap,
+        intervalSec: opts.interval,
+        maxExits:    opts.maxExits,
+        dryRun:      opts.dryRun,
+      });
+    } catch (e) { emit({ event: "fatal_error", error: String(e) }); process.exit(1); }
   });
 
-program.parseAsync(process.argv).catch((e) => {
-  fatal((e as Error).message, "PARSE_ERROR");
-});
+if (import.meta.main) {
+  program.parse(process.argv);
+}
