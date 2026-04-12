@@ -504,7 +504,7 @@ async function cmdStatus(opts: {
     recommendation: snap.in_range
       ? "Position is in range. Run the `run` command to start the IL sentinel loop."
       : "Position is out of range — earning no fees. Consider rebalancing before starting the sentinel.",
-    note: "IL% is tracked by `run` via a high-water-mark baseline captured at session start. `status` reports live position state only.",
+    note: "IL% is tracked by `run` via a entry-mark baseline captured at session start. `status` reports live position state only.",
   });
 }
 
