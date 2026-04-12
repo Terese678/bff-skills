@@ -1,75 +1,98 @@
-skill: "hodlmm-stop-loss"
+---
+name: "hodlmm-stop-loss"
 version: "1.0.0"
-description: "Sentinel agent that continuously monitors a Bitflow HODLMM concentrated liquidity position across multiple health dimensions — value erosion, out-of-range duration, and fee-drag ratio — and autonomously removes a configurable percentage of liquidity when a stop-loss threshold is breached. Designed to protect capital during adverse price movements without requiring manual intervention."
+description: "Autonomously guards a Bitflow HODLMM concentrated liquidity position by tracking impermanent loss (IL) in real time and executing a partial liquidity withdrawal via withdraw-liquidity-same-multi when IL breaches a user-defined threshold for two consecutive cycles — protecting capital before losses compound."
 author: "Terese678"
 author-agent: "Merged Vale"
 user-invocable: "false"
 entry: "skills/hodlmm-stop-loss/hodlmm-stop-loss.ts"
-tags: "defi, write, hodlmm, risk-management, autonomous"
+tags: "defi, write, hodlmm, risk-management, impermanent-loss"
 requires: "STACKS_PRIVATE_KEY, STACKS_ADDRESS"
 
 metadata:
-  name: "HODLMM Stop-Loss Sentinel"
   category: "DeFi / Risk Management"
   hodlmm-integration: "true"
   skill-type: "write"
-  chain: "stacks"
   network: "mainnet"
+  protocols: "Bitflow HODLMM"
+  router: "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-1"
+  function: "withdraw-liquidity-same-multi"
+  trigger: "Impermanent loss exceeds --il-threshold for 2 consecutive cycles"
+  action: "Remove configurable percentage of liquidity shares per bin"
+  safety: "2-cycle confirmation window, 10-block cooldown (~100 min), session exit cap, fee-cap required"
 
 commands:
   doctor:
-    description: "Validates environment variables, wallet connectivity, Bitflow API reachability, and pool existence. Outputs a JSON health report with actionable error messages."
-    usage: "bun hodlmm-stop-loss.ts doctor --pool <pool-id>"
-    output: "{ status, checks: { env, wallet, api, pool }, warnings }"
+    description: "Validates Bitflow API, Hiro API, wallet balance, and @stacks/transactions availability."
+    output: "JSON health report with per-check ok/detail"
 
   status:
-    description: "Fetches current position snapshot — active bin, deposited range, USD value, out-of-range duration estimate, and current stop-loss threshold proximity. Does not write to chain."
-    usage: "bun hodlmm-stop-loss.ts status --pool <pool-id> --threshold <0-100>"
-    output: "{ pool, position, value_usd, threshold_pct, distance_to_trigger_pct, health_score, recommendation }"
+    description: "Fetches live position data — shares, bin range, in-range status, current USD value. Reports IL threshold for reference. Drawdown tracking requires a live run session."
+    flags:
+      - "--pool <id>          Pool ID (e.g. dlmm_3)"
+      - "--wallet <address>   STX address"
+      - "--il-threshold <n>   IL% for reference (default: 5)"
+    output: "JSON position snapshot"
 
   run:
-    description: "Starts the sentinel loop. Polls position health every --interval seconds. When value drops below --threshold percent of peak observed value, broadcasts a remove-liquidity transaction for --exit-pct percent of total shares. Enforces cooldown between triggers to prevent repeated partial exits."
-    usage: "bun hodlmm-stop-loss.ts run --pool <pool-id> --threshold <pct> --exit-pct <pct> --fee-cap <stx> [--interval <seconds>] [--dry-run]"
-    output: "Streaming JSON events: { event, timestamp, data }"
+    description: "Enters a monitoring loop. Captures entry snapshot at session start. Each cycle computes IL vs entry baseline. If IL >= threshold for 2 consecutive cycles, executes withdraw-liquidity-same-multi for exit-pct of shares across all user bins. Halts after max-exits."
+    flags:
+      - "--pool <id>          Pool ID to monitor"
+      - "--wallet <address>   STX address"
+      - "--password <pass>    Wallet password (required for live execution)"
+      - "--il-threshold <n>   IL% that triggers exit (default: 5)"
+      - "--exit-pct <n>       % of shares to remove per trigger (default: 50)"
+      - "--fee-cap <stx>      Max STX fee per tx (REQUIRED)"
+      - "--interval <sec>     Polling interval in seconds (default: 60)"
+      - "--max-exits <n>      Max exit transactions per session (default: 3, hard cap: 10)"
+      - "--dry-run            Simulate without broadcasting"
+    output: "Streaming JSON events"
 
-parameters:
-  --pool: "HODLMM pool ID (e.g. dlmm_3)"
-  --threshold: "Stop-loss trigger: percentage drop from peak value (e.g. 20 = trigger at 20% drawdown)"
-  --exit-pct: "Percentage of total LP shares to remove when triggered (1-100)"
-  --fee-cap: "Maximum STX fee per transaction. Required. Agent refuses to act if fee exceeds cap."
-  --interval: "Poll interval in seconds (default: 60, min: 30)"
-  --dry-run: "Simulate sentinel loop without broadcasting transactions"
+examples:
+  - "bun hodlmm-stop-loss.ts doctor --wallet SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K"
+  - "bun hodlmm-stop-loss.ts status --pool dlmm_3 --wallet SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K"
+  - "STACKS_PRIVATE_KEY=<key> bun hodlmm-stop-loss.ts run --pool dlmm_3 --wallet SP2A37... --il-threshold 5 --exit-pct 50 --fee-cap 0.1 --dry-run"
+  - "STACKS_PRIVATE_KEY=<key> bun hodlmm-stop-loss.ts run --pool dlmm_3 --wallet SP2A37... --il-threshold 5 --exit-pct 50 --fee-cap 0.1 --max-exits 3"
+---
 
-safety:
-  cooldown-blocks: 10
-  max-triggers-per-session: 3
-  min-exit-pct: 1
-  max-exit-pct: 100
-  fee-cap-required: "true"
-  post-condition-mode: "Deny"
-  refusal-conditions:
-    - "STACKS_PRIVATE_KEY not set"
-    - "--fee-cap not provided"
-    - "Estimated fee exceeds --fee-cap"
-    - "Pool not found or inactive"
-    - "Position has zero shares"
-    - "Trigger fired within cooldown window"
-    - "max-triggers-per-session reached"
-    - "API returns stale data (>5 min old)"
+# HODLMM Stop-Loss
 
-output-contract:
-  format: "strict JSON to stdout"
-  errors: "{ error: string, code: string }"
-  events:
-    - "sentinel_started"
-    - "position_snapshot"
-    - "threshold_breached"
-    - "transaction_prepared"
-    - "transaction_confirmed"
-    - "cooldown_active"
-    - "session_cap_reached"
-    - "sentinel_stopped"
+A capital-protection skill for Bitflow HODLMM liquidity providers. Unlike bin-range monitors that only detect when a position goes out of range, this skill computes **impermanent loss in real time** — comparing the current USD value of your LP position against a HODL baseline (what the deposited tokens would be worth if never deposited). When IL breaches your threshold for two consecutive cycles, it autonomously withdraws a configurable percentage of your liquidity via `withdraw-liquidity-same-multi` on the DLMM liquidity router.
 
-proof:
-  agent-registration: "https://explorer.hiro.so/txid/YOUR_TX_HERE?chain=mainnet"
-  dry-run-output: "available on request"
+## Architecture
+
+- **Router:** `SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-1`
+- **Function:** `withdraw-liquidity-same-multi`
+- **Bin IDs:** converted from unsigned API values to signed contract offsets (`signed = unsigned - 500`)
+- **Post-conditions:** `PostConditionMode.Allow` with aggregate `min-x-amount-total` / `min-y-amount-total` slippage floors (1% tolerance). DLP burn+mint in the same tx cannot be expressed as sender-side post-conditions — slippage protection is enforced by the router's built-in assertions.
+
+## IL formula
+
+```
+HODL value  = entryAmountX * currentPriceX + entryAmountY * currentPriceY
+LP value    = current position USD value (share of reserves)
+IL%         = (HODL_value - LP_value) / HODL_value * 100
+```
+
+Entry snapshot is captured once at session start. IL grows as price diverges from entry; shrinks as price reverts.
+
+## Safety design
+
+| Mechanism | Detail |
+|---|---|
+| 2-cycle confirmation window | IL must exceed threshold for 2 consecutive cycles before any exit — prevents false triggers on transient spikes |
+| --fee-cap required | Refuses to start without explicit spend limit |
+| 10-block cooldown (~100 min) | Block-based cooldown between exits on Stacks mainnet |
+| --max-exits session cap | Hard upper bound of 10 exits per session |
+| --dry-run mode | Full simulation without on-chain writes |
+| Aggregate slippage floors | min-x/y-amount-total at 1% tolerance passed to router |
+
+## Refusal conditions
+
+- `--fee-cap` not provided
+- `--exit-pct` > 100
+- `--max-exits` > 10
+- Wallet STX balance < 0.05 STX
+- IL confirmation streak < 2 (single-cycle spike)
+- Pool contract format invalid (missing deployer.name separator)
+- Position has zero DLP shares
