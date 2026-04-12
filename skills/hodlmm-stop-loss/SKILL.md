@@ -1,98 +1,94 @@
 ---
-name: "hodlmm-stop-loss"
-version: "1.0.0"
-description: "Autonomously guards a Bitflow HODLMM concentrated liquidity position by tracking impermanent loss (IL) in real time and executing a partial liquidity withdrawal via withdraw-liquidity-same-multi when IL breaches a user-defined threshold for two consecutive cycles — protecting capital before losses compound."
-author: "Terese678"
-author-agent: "Merged Vale"
-user-invocable: "false"
-entry: "skills/hodlmm-stop-loss/hodlmm-stop-loss.ts"
-tags: "defi, write, hodlmm, risk-management, impermanent-loss"
-requires: "STACKS_PRIVATE_KEY, STACKS_ADDRESS"
-
-metadata:
-  category: "DeFi / Risk Management"
-  hodlmm-integration: "true"
-  skill-type: "write"
-  network: "mainnet"
-  protocols: "Bitflow HODLMM"
-  router: "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-1"
-  function: "withdraw-liquidity-same-multi"
-  trigger: "Impermanent loss exceeds --il-threshold for 2 consecutive cycles"
-  action: "Remove configurable percentage of liquidity shares per bin"
-  safety: "2-cycle confirmation window, 10-block cooldown (~100 min), session exit cap, fee-cap required"
-
-commands:
-  doctor:
-    description: "Validates Bitflow API, Hiro API, wallet balance, and @stacks/transactions availability."
-    output: "JSON health report with per-check ok/detail"
-
-  status:
-    description: "Fetches live position data — shares, bin range, in-range status, current USD value. Reports IL threshold for reference. Drawdown tracking requires a live run session."
-    flags:
-      - "--pool <id>          Pool ID (e.g. dlmm_3)"
-      - "--wallet <address>   STX address"
-      - "--il-threshold <n>   IL% for reference (default: 5)"
-    output: "JSON position snapshot"
-
-  run:
-    description: "Enters a monitoring loop. Captures entry snapshot at session start. Each cycle computes IL vs entry baseline. If IL >= threshold for 2 consecutive cycles, executes withdraw-liquidity-same-multi for exit-pct of shares across all user bins. Halts after max-exits."
-    flags:
-      - "--pool <id>          Pool ID to monitor"
-      - "--wallet <address>   STX address"
-      - "--password <pass>    Wallet password (required for live execution)"
-      - "--il-threshold <n>   IL% that triggers exit (default: 5)"
-      - "--exit-pct <n>       % of shares to remove per trigger (default: 50)"
-      - "--fee-cap <stx>      Max STX fee per tx (REQUIRED)"
-      - "--interval <sec>     Polling interval in seconds (default: 60)"
-      - "--max-exits <n>      Max exit transactions per session (default: 3, hard cap: 10)"
-      - "--dry-run            Simulate without broadcasting"
-    output: "Streaming JSON events"
-
-examples:
-  - "bun hodlmm-stop-loss.ts doctor --wallet SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K"
-  - "bun hodlmm-stop-loss.ts status --pool dlmm_3 --wallet SP2A37MQTATZTY386B8NQR6RZA15GF0BQNFVZP79K"
-  - "STACKS_PRIVATE_KEY=<key> bun hodlmm-stop-loss.ts run --pool dlmm_3 --wallet SP2A37... --il-threshold 5 --exit-pct 50 --fee-cap 0.1 --dry-run"
-  - "STACKS_PRIVATE_KEY=<key> bun hodlmm-stop-loss.ts run --pool dlmm_3 --wallet SP2A37... --il-threshold 5 --exit-pct 50 --fee-cap 0.1 --max-exits 3"
+name: "HODLMM Stop-Loss Agent"
+skill: "hodlmm-stop-loss"
+description: "Guards a Bitflow HODLMM position against impermanent loss by autonomously withdrawing a configurable percentage of liquidity when IL breaches a user-defined threshold for two consecutive cycles. Operates with strict spend limits, a block-based cooldown, and a per-session exit cap."
 ---
 
-# HODLMM Stop-Loss
+# Agent Behavior
 
-A capital-protection skill for Bitflow HODLMM liquidity providers. Unlike bin-range monitors that only detect when a position goes out of range, this skill computes **impermanent loss in real time** — comparing the current USD value of your LP position against a HODL baseline (what the deposited tokens would be worth if never deposited). When IL breaches your threshold for two consecutive cycles, it autonomously withdraws a configurable percentage of your liquidity via `withdraw-liquidity-same-multi` on the DLMM liquidity router.
+## Identity
 
-## Architecture
+This agent is a capital-protection guardian for Bitflow HODLMM concentrated liquidity positions. It computes impermanent loss (IL) in real time against an entry baseline captured at session start. When IL confirms above threshold for two consecutive cycles, it executes a partial withdrawal via `withdraw-liquidity-same-multi` on the DLMM router.
 
-- **Router:** `SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-1`
+It does not rebalance. It does not harvest fees. It exits and protects.
+
+## On-chain execution details
+
+- **Router contract:** `SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-1`
 - **Function:** `withdraw-liquidity-same-multi`
-- **Bin IDs:** converted from unsigned API values to signed contract offsets (`signed = unsigned - 500`)
-- **Post-conditions:** `PostConditionMode.Allow` with aggregate `min-x-amount-total` / `min-y-amount-total` slippage floors (1% tolerance). DLP burn+mint in the same tx cannot be expressed as sender-side post-conditions — slippage protection is enforced by the router's built-in assertions.
+- **Bin ID conversion:** `signed_bin_id = unsigned_api_bin_id - 500` (CENTER_BIN_ID)
+- **Post-condition mode:** `Allow` — DLP burn+mint cannot be expressed as sender-side post-conditions; slippage enforced by `min-x/y-amount-total` args (1% tolerance)
 
-## IL formula
+## Decision order
 
 ```
-HODL value  = entryAmountX * currentPriceX + entryAmountY * currentPriceY
-LP value    = current position USD value (share of reserves)
-IL%         = (HODL_value - LP_value) / HODL_value * 100
+1.  doctor — verify APIs, wallet balance, @stacks/transactions
+2.  fetchPool — validate pool exists in Bitflow registry
+3.  fetchTokenPricesUsd — get current USD prices for token pair
+4.  buildSnapshot (entry) — capture entry position at session start
+5.  If entry DLP = 0 → emit halt(no_position_found) → exit 0
+6.  getWalletKeys — decrypt wallet once (skipped in dry-run)
+7.  Loop:
+8.    sleep(intervalSec)
+9.    fetchTokenPricesUsd + buildSnapshot (current) + fetchUserBins
+10.   If current DLP = 0 → emit halt(position_empty) → exit 0
+11.   computeIL — compare current LP value vs HODL baseline
+12.   If il_pct < il_threshold → reset confirmationStreak → emit cycle(MONITORING) → continue
+13.   If il_pct >= il_threshold → increment confirmationStreak
+14.   If confirmationStreak < 2 → emit threshold_pending_confirmation → continue
+15.   If confirmationStreak >= 2 → proceed to exit
+16.   Check cooldown: if currentBlock - lastExitBlock < 10 → emit cooldown_active → continue
+17.   Check wallet balance: if < 0.05 STX → emit halt(insufficient_stx) → exit 1
+18.   If dry_run → emit simulated tx_broadcast + tx_confirmed → record exit
+19.   If live → fetchNonce → executeWithdrawal → emit tx_broadcast → emit tx_confirmed
+20.   Reset confirmationStreak → save persistent state → increment exitsExecuted
+21.   If exitsExecuted >= maxExits → break
+22.   Emit cooldown_start (10 blocks)
+23. emit halt(max_exits_reached) → exit 0
 ```
-
-Entry snapshot is captured once at session start. IL grows as price diverges from entry; shrinks as price reverts.
-
-## Safety design
-
-| Mechanism | Detail |
-|---|---|
-| 2-cycle confirmation window | IL must exceed threshold for 2 consecutive cycles before any exit — prevents false triggers on transient spikes |
-| --fee-cap required | Refuses to start without explicit spend limit |
-| 10-block cooldown (~100 min) | Block-based cooldown between exits on Stacks mainnet |
-| --max-exits session cap | Hard upper bound of 10 exits per session |
-| --dry-run mode | Full simulation without on-chain writes |
-| Aggregate slippage floors | min-x/y-amount-total at 1% tolerance passed to router |
 
 ## Refusal conditions
 
-- `--fee-cap` not provided
+The agent refuses to broadcast if ANY of the following are true:
+
+- `--fee-cap` flag not provided at startup
 - `--exit-pct` > 100
-- `--max-exits` > 10
-- Wallet STX balance < 0.05 STX
-- IL confirmation streak < 2 (single-cycle spike)
-- Pool contract format invalid (missing deployer.name separator)
+- `--max-exits` > 10 (hard cap)
+- Wallet STX balance < 0.05 STX at time of exit
+- IL confirmation streak < 2 (single-cycle spike — not confirmed)
+- Pool not found in Bitflow DLMM registry
+- Pool contract missing deployer.name separator
 - Position has zero DLP shares
+
+## Parameters and defaults
+
+| Flag | Default | Notes |
+|---|---|---|
+| --pool | required | Bitflow HODLMM pool ID (e.g. dlmm_3) |
+| --wallet | required | STX address |
+| --password | "" | Required for live execution; unused in dry-run |
+| --il-threshold | 5 | IL% that triggers confirmation window |
+| --exit-pct | 50 | % of DLP shares to remove per trigger |
+| --fee-cap | required | Max STX fee — no default, must be explicit |
+| --interval | 60 | Polling interval in seconds |
+| --max-exits | 3 | Max exit transactions per session (hard cap: 10) |
+| --dry-run | false | Simulate without broadcasting |
+
+## Output guarantees
+
+- All stdout is newline-delimited JSON with timestamp field
+- stderr is used only for fatal startup errors
+- Exit code 0 = clean halt; Exit code 1 = fatal error
+
+## Operational limits
+
+- Maximum exits per session: 10 (hard cap regardless of --max-exits)
+- Cooldown between exits: 10 Stacks blocks (~100 minutes on mainnet)
+- IL confirmation window: 2 consecutive cycles above threshold required
+- Confirmation streak resets on any cycle where IL drops below threshold
+
+## Safety rationale
+
+IL is a function of price — prices can spike and recover within seconds. A single IL reading above threshold does not justify an on-chain transaction that incurs fees and permanent position changes. Two consecutive readings above threshold provide meaningful confirmation that the loss is real and sustained, not a transient artifact of a single price data point.
+
+Block-based cooldown (10 blocks) is used instead of wall-clock time because Stacks block production is the relevant unit of on-chain activity — it ensures the position has had time to reflect post-withdrawal state before any further action.
