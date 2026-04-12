@@ -1,103 +1,92 @@
 ---
-name: "HODLMM Stop-Loss Sentinel"
+name: "HODLMM Stop-Loss Agent"
 skill: "hodlmm-stop-loss"
-description: "Autonomous sentinel that monitors a Bitflow HODLMM position for value erosion and executes a partial or full liquidity exit when a configurable drawdown threshold is breached. Protects LP capital during adverse price movements without requiring manual intervention."
+description: "Guards a Bitflow HODLMM position against impermanent loss by autonomously withdrawing a configurable percentage of liquidity when IL breaches a user-defined threshold for two consecutive cycles. Operates with strict spend limits, a block-based cooldown, and a per-session exit cap."
 ---
 
 # Agent Behavior
 
-## Purpose
+## Identity
 
-This agent acts as a capital protection layer for Bitflow HODLMM liquidity positions. It continuously tracks position value relative to a peak high-water mark. When the value drops by a user-defined percentage, it autonomously removes a configured share of liquidity and broadcasts the transaction on-chain — then enters a cooldown period to prevent repeated triggering during volatile conditions.
+This agent is a capital-protection guardian for Bitflow HODLMM concentrated liquidity positions. It computes impermanent loss (IL) in real time against an entry baseline captured at session start. When IL confirms above threshold for two consecutive cycles, it executes a partial withdrawal via `withdraw-liquidity-same-multi` on the DLMM router.
 
-## Decision Order
+It does not rebalance. It does not harvest fees. It exits and protects.
 
-1. Run `doctor` to confirm environment, wallet, API, and pool are all healthy
-2. Run `status` to establish baseline position value and distance to threshold
-3. If all checks pass and `--dry-run` is not set, start the sentinel loop
-4. On each poll cycle:
-   a. Fetch current position value from Bitflow API
-   b. Update high-water mark if value has increased
-   c. Calculate drawdown: `(peak - current) / peak * 100`
-   d. If drawdown >= threshold AND cooldown has elapsed AND session cap not reached:
-      - Prepare remove-liquidity transaction for `exit-pct` of shares
-      - Validate estimated fee against `--fee-cap`
-      - Broadcast with PostConditionMode.Deny
-      - Poll for confirmation (max 10 blocks)
-      - Enter cooldown (10 blocks)
-      - Increment trigger counter
-   e. Emit JSON event to stdout regardless of action
+## On-chain execution details
 
-## Operational Limits
+- **Router contract:** `SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-1`
+- **Function:** `withdraw-liquidity-same-multi`
+- **Bin ID conversion:** `signed_bin_id = unsigned_api_bin_id - 500` (CENTER_BIN_ID)
+- **Post-condition mode:** `Allow` — DLP burn+mint cannot be expressed as sender-side post-conditions; slippage enforced by `min-x/y-amount-total` args (1% tolerance)
 
-| Parameter | Default | Hard Limit |
+## Decision order
+
+```
+1.  doctor — verify APIs, wallet balance, @stacks/transactions
+2.  fetchPool — validate pool exists in Bitflow registry
+3.  fetchTokenPricesUsd — get current USD prices for token pair
+4.  buildSnapshot (entry) — capture entry position at session start
+5.  If entry DLP = 0 → emit halt(no_position_found) → exit 0
+6.  getWalletKeys — decrypt wallet once (skipped in dry-run)
+7.  Loop:
+8.    sleep(intervalSec)
+9.    fetchTokenPricesUsd + buildSnapshot (current) + fetchUserBins
+10.   If current DLP = 0 → emit halt(position_empty) → exit 0
+11.   computeIL — compare current LP value vs HODL baseline from entry snapshot
+12.   If il_pct < il_threshold → reset confirmationStreak → emit cycle(MONITORING) → continue
+13.   If il_pct >= il_threshold → increment confirmationStreak
+14.   If confirmationStreak < 2 → emit threshold_pending_confirmation → continue
+15.   If confirmationStreak >= 2 → proceed to exit
+16.   Check cooldown: if currentBlock - lastExitBlock < 10 → emit cooldown_active → continue
+17.   Check wallet balance: if < 0.05 STX → emit halt(insufficient_stx) → exit 1
+18.   If dry_run → emit simulated tx_broadcast + tx_confirmed → record exit
+19.   If live → fetchNonce → executeWithdrawal → emit tx_broadcast → emit tx_confirmed
+20.   Reset confirmationStreak → save persistent state → increment exitsExecuted
+21.   If exitsExecuted >= maxExits → break
+22.   Emit cooldown_start (10 blocks ~100 minutes)
+23. emit halt(max_exits_reached) → exit 0
+```
+
+## Refusal conditions
+
+The agent refuses to broadcast if ANY of the following are true:
+
+- `--fee-cap` flag not provided at startup
+- `--exit-pct` > 100
+- `--max-exits` > 10 (hard cap)
+- Wallet STX balance < 0.05 STX at time of exit
+- IL confirmation streak < 2 (single-cycle spike — not confirmed)
+- Pool not found in Bitflow DLMM registry
+- Pool contract missing deployer.name separator
+- Position has zero DLP shares
+
+## Parameters and defaults
+
+| Flag | Default | Notes |
 |---|---|---|
-| Poll interval | 60s | min 30s |
-| Max triggers per session | — | 3 |
-| Cooldown after trigger | — | 10 blocks |
-| Fee cap | required | user-defined |
-| Exit percentage | required | 1–100% |
+| --pool | required | Bitflow HODLMM pool ID (e.g. dlmm_3) |
+| --wallet | required | STX address |
+| --password | "" | Required for live execution; unused in dry-run |
+| --il-threshold | 5 | IL% that triggers confirmation window |
+| --exit-pct | 50 | % of DLP shares to remove per trigger |
+| --fee-cap | required | Max STX fee — no default, must be explicit |
+| --interval | 60 | Polling interval in seconds |
+| --max-exits | 3 | Max exit transactions per session (hard cap: 10) |
+| --dry-run | false | Simulate without broadcasting |
 
-## Refusal Conditions
+## Output guarantees
 
-The agent will refuse to start or act if any of the following are true:
+- All stdout is newline-delimited JSON with timestamp field
+- stderr is used only for fatal startup errors
+- Exit code 0 = clean halt; Exit code 1 = fatal error
 
-- `STACKS_PRIVATE_KEY` is not set in environment
-- `--fee-cap` flag is missing
-- Estimated transaction fee exceeds `--fee-cap`
-- Pool ID does not exist or returns no active bins
-- Position has zero LP shares
-- Trigger fired within the 10-block cooldown window
-- Session trigger cap (3) has been reached
-- API data is stale (timestamp older than 5 minutes)
-- `--threshold` is set to 0 (would trigger immediately)
-- `--exit-pct` is set to 0 (no-op exit)
+## Operational limits
 
-## Autonomy Notes
+- Maximum exits per session: 10 (hard cap regardless of --max-exits)
+- Cooldown between exits: 10 Stacks blocks (~100 minutes on mainnet)
+- IL confirmation window: 2 consecutive cycles above threshold required
+- Confirmation streak resets on any cycle where IL drops below threshold
 
-This agent executes real on-chain transactions without human approval per cycle. It is designed to be safe by default:
+## Safety rationale
 
-- **PostConditionMode.Deny** on all transactions — contract cannot take more tokens than explicitly authorized
-- **High-water mark tracking** — threshold is relative to peak observed value, not entry price
-- **Cooldown enforcement** — prevents cascading exits during flash volatility
-- **Session cap** — stops the agent after 3 triggers so a human can review
-- **Fee cap** — hard stops any transaction where the estimated fee exceeds the user's limit
-- **Dry-run mode** — full sentinel simulation without any broadcast
-
-## Output Format
-
-All output is strict JSON to stdout. One JSON object per line.
-
-```json
-{ "event": "sentinel_started", "timestamp": "...", "data": { "pool": "dlmm_3", "threshold_pct": 20, "exit_pct": 50, "fee_cap_stx": 0.1 } }
-{ "event": "position_snapshot", "timestamp": "...", "data": { "value_usd": 1.10, "peak_usd": 1.42, "drawdown_pct": 22.5, "shares": "1000000" } }
-{ "event": "threshold_breached", "timestamp": "...", "data": { "drawdown_pct": 22.5, "threshold_pct": 20, "action": "remove_liquidity" } }
-{ "event": "transaction_confirmed", "timestamp": "...", "data": { "txid": "0x...", "shares_removed": "500000", "fee_stx": 0.08 } }
-{ "event": "cooldown_active", "timestamp": "...", "data": { "blocks_remaining": 10 } }
-```
-
-## Example Usage
-
-```bash
-# Check environment health
-bun hodlmm-stop-loss.ts doctor --pool dlmm_3
-
-# Preview position and threshold proximity
-bun hodlmm-stop-loss.ts status --pool dlmm_3 --threshold 20
-
-# Run sentinel: exit 50% of shares if value drops 20% from peak
-bun hodlmm-stop-loss.ts run \
-  --pool dlmm_3 \
-  --threshold 20 \
-  --exit-pct 50 \
-  --fee-cap 0.1 \
-  --interval 60
-
-# Dry run (no transactions broadcast)
-bun hodlmm-stop-loss.ts run \
-  --pool dlmm_3 \
-  --threshold 20 \
-  --exit-pct 50 \
-  --fee-cap 0.1 \
-  --dry-run
-```
+IL is a function of price — prices can spike and recover within seconds. A single IL reading above threshold does not justify an on-chain transaction. Two consecutive readings provide meaningful confirmation that the loss is real and sustained. Block-based cooldown (10 blocks ~100 minutes) ensures the position has settled post-withdrawal before any further action.
