@@ -606,13 +606,11 @@ async function cmdRun(opts: {
     let userBins: UserBin[];
 
     try {
-      [currentPrices, currentSnap, userBins] = await Promise.all([
-        fetchTokenPricesUsd(),
-        buildSnapshot(pool, opts.wallet, prices),
+      currentPrices = await fetchTokenPricesUsd();
+      [currentSnap, userBins] = await Promise.all([
+        buildSnapshot(pool, opts.wallet, currentPrices),
         fetchUserBins(opts.pool, opts.wallet),
       ]);
-      // Refresh current snap with latest prices
-      currentSnap = await buildSnapshot(pool, opts.wallet, currentPrices);
     } catch (e) {
       emit({ event: "error", cycle, error: String(e), action: "retrying_next_cycle" });
       continue;
