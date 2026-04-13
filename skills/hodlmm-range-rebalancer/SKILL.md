@@ -1,4 +1,4 @@
-﻿---
+---
 name: hodlmm-range-rebalancer
 description: "Monitors a Bitflow HODLMM liquidity position and autonomously rebalances the bin range when the active bin moves outside the deposited range, preserving yield continuity."
 metadata:

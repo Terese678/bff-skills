@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bun
+#!/usr/bin/env bun
 /**
  * hodlmm-range-rebalancer
  *

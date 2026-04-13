@@ -1,4 +1,4 @@
-﻿---
+---
 name: hodlmm-range-rebalancer-agent
 skill: hodlmm-range-rebalancer
 description: "Autonomous HODLMM LP rebalancer. Detects out-of-range positions and moves liquidity bins to re-center on the active bin using the Bitflow HODLMM API and move-relative-liquidity-multi."
