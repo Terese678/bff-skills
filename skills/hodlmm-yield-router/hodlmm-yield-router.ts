@@ -127,7 +127,7 @@ function saveState(state: RouterState) {
 }
 
 // ── Wallet ─────────────────────────────────────────────────────────────────
-// [FIXED] Updated to match AIBTC keystore.json format stored by ID folder
+// [FIXED] Derives private key from mnemonic stored in AIBTC keystore.json
 function getWalletKeys(): { privateKey: string; address: string } {
   const walletSecret = process.env.WALLET_SECRET ?? "";
   const encryptionKey = process.env.ENCRYPTION_KEY ?? "";
@@ -152,29 +152,32 @@ function getWalletKeys(): { privateKey: string; address: string } {
     const keystorePath = path.join(WALLETS_DIR, wallet.id, "keystore.json");
     const keystoreRaw = fs.readFileSync(keystorePath, "utf8");
     const keystore = JSON.parse(keystoreRaw);
-
     const { ciphertext, iv, authTag, salt, scryptParams } = keystore.encrypted;
 
-    // Derive key using stored scrypt params from keystore
+    // Decrypt to get mnemonic
     const key = crypto.scryptSync(
       encryptionKey,
       Buffer.from(salt, "base64"),
       scryptParams.keyLen,
       { N: scryptParams.N, r: scryptParams.r, p: scryptParams.p }
     );
-
     const decipher = crypto.createDecipheriv(
-      "aes-256-gcm",
-      key,
-      Buffer.from(iv, "base64")
+      "aes-256-gcm", key, Buffer.from(iv, "base64")
     );
     decipher.setAuthTag(Buffer.from(authTag, "base64"));
-
-    const decrypted =
+    const mnemonic =
       decipher.update(Buffer.from(ciphertext, "base64")).toString("utf8") +
       decipher.final("utf8");
 
-    const { privateKey } = JSON.parse(decrypted);
+    // [FIXED] Derive private key from mnemonic using BIP39/BIP32
+    const { mnemonicToSeedSync } = require("@scure/bip39");
+    const { HDKey } = require("@scure/bip32");
+    const seed = mnemonicToSeedSync(mnemonic.trim());
+    const hdKey = HDKey.fromMasterSeed(seed);
+    // Stacks derivation path: m/44'/5757'/0'/0/0
+    const child = hdKey.derive("m/44'/5757'/0'/0/0");
+    const privateKey = Buffer.from(child.privateKey!).toString("hex") + "01";
+
     const address = getAddressFromPrivateKey(
       privateKey,
       TransactionVersion.Mainnet
