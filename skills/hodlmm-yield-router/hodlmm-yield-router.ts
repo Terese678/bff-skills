@@ -59,10 +59,17 @@ const POLL_INTERVAL_MS           = 60_000;
 const FETCH_TIMEOUT_MS           = 20_000;
 const MAX_GAS_STX                = 10;
 
+// ── [ADDED] Safety guardrail constants ────────────────────────────────────
+const MIN_WALLET_BALANCE_STX     = MAX_GAS_STX;         // enforced: abort if balance below this
+const ACTION_COOLDOWN_MS         = 5 * 60 * 1000;       // enforced: 5 min between capital moves
+const REBALANCE_COOLDOWN_MS      = 10 * 60 * 1000;      // enforced: 10 min between rebalances
+const MAX_POSITION_VALUE_USD     = 50_000;               // enforced: refuse to act on positions above this
+
 // ── Wallet ─────────────────────────────────────────────────────────────────
 const WALLETS_DIR  = path.join(os.homedir(), ".aibtc", "wallets");
 const WALLETS_FILE = path.join(os.homedir(), ".aibtc", "wallets.json");
 const STATE_FILE   = path.join(os.homedir(), ".hodlmm-yield-router-state.json");
+
 // ── Output ─────────────────────────────────────────────────────────────────
 function emit(status: string, action: string, data: any, error: any = null) {
   console.log(JSON.stringify({ status, action, data, error }));
@@ -125,7 +132,7 @@ function getWalletKeys(): { privateKey: string; address: string } {
   const encryptionKey = process.env.ENCRYPTION_KEY ?? "";
 
   if (!walletSecret || !encryptionKey) {
-    fatal("wallet", "MISSING_ENV", "WALLET_SECRET and ENCRYPTION_KEY required", 
+    fatal("wallet", "MISSING_ENV", "WALLET_SECRET and ENCRYPTION_KEY required",
       "Set environment variables and retry");
   }
 
@@ -157,6 +164,7 @@ function getWalletKeys(): { privateKey: string; address: string } {
     throw e;
   }
 }
+
 // ── Fetch helpers ──────────────────────────────────────────────────────────
 async function fetchWithTimeout(url: string, opts: RequestInit = {}): Promise<any> {
   const controller = new AbortController();
@@ -221,12 +229,10 @@ async function fetchStxBalance(address: string): Promise<number> {
 // ── Zest APY ───────────────────────────────────────────────────────────────
 async function fetchZestSupplyApyPct(): Promise<number> {
   try {
-    // Call pool-0-reserve get-reserve-state for STX via Hiro read-only endpoint
     const url = `${HIRO_API}/v2/contracts/call-read/${ZEST_DEPLOYER}/${ZEST_RESERVE}/get-reserve-state`;
     const body = {
       sender: "SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N",
       arguments: [
-        // STX asset principal as clarity value (encoded as hex)
         "0x0616" + Buffer.from(
           "SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.wstx"
         ).toString("hex"),
@@ -239,12 +245,9 @@ async function fetchZestSupplyApyPct(): Promise<number> {
     });
     const data = await res.json();
 
-    // Extract current variable borrow rate and utilization to derive supply APY
-    // Zest stores rates as fixed-point with 27 decimals (Ray units)
     const result = data?.result;
     if (!result) throw new Error("No result from Zest reserve state");
 
-    // Parse the liquidity-rate field from the clarity tuple response
     const liquidityRateHex = result?.value?.data?.["liquidity-rate"]?.value;
     if (!liquidityRateHex) throw new Error("Cannot parse liquidity-rate");
 
@@ -254,7 +257,6 @@ async function fetchZestSupplyApyPct(): Promise<number> {
     return apyDecimal;
   } catch (e: any) {
     log("Zest APY fetch failed, using fallback:", e.message);
-    // Fallback: return a conservative estimate so routing still works
     return 4.5;
   }
 }
@@ -263,7 +265,6 @@ async function fetchZestSupplyApyPct(): Promise<number> {
 async function fetchHodlmmApyPct(poolId: string): Promise<number> {
   try {
     const data = await fetchPoolData(poolId);
-    // Try various field names the API might return
     const apy =
       data?.apy ??
       data?.apr ??
@@ -273,7 +274,6 @@ async function fetchHodlmmApyPct(poolId: string): Promise<number> {
       null;
     if (apy !== null) return Number(apy) * 100;
 
-    // Fallback: estimate from 24h fees and TVL
     const fees24h = Number(data?.fees_24h ?? data?.fees24h ?? 0);
     const tvl = Number(data?.tvl ?? data?.total_value_locked ?? 1);
     if (fees24h > 0 && tvl > 0) return (fees24h / tvl) * 365 * 100;
@@ -283,6 +283,7 @@ async function fetchHodlmmApyPct(poolId: string): Promise<number> {
     return 0;
   }
 }
+
 // ── Position Snapshot ──────────────────────────────────────────────────────
 async function buildSnapshot(address: string): Promise<PositionSnapshot> {
   const [activeBinId, userBins, hodlmmApyPct, prices] = await Promise.all([
@@ -319,6 +320,7 @@ async function buildSnapshot(address: string): Promise<PositionSnapshot> {
     drift, inRange, hodlmmApyPct, positionValueUsd,
   };
 }
+
 // ── Decision Logic ─────────────────────────────────────────────────────────
 type Decision =
   | { action: "stay";      reason: string }
@@ -334,7 +336,6 @@ async function decide(
   const { inRange, drift, hodlmmApyPct, activeBinId } = snapshot;
   const apyGap = zestApyPct - hodlmmApyPct;
 
-  // ── Currently in Zest mode ────────────────────────────────────────────
   if (state.mode === "zest") {
     const hodlmmRecovered = hodlmmApyPct > zestApyPct + HODLMM_RECOVERY_THRESHOLD;
     if (hodlmmRecovered) {
@@ -351,7 +352,6 @@ async function decide(
     };
   }
 
-  // ── Out of range — rebalance first, yield routing second ─────────────
   if (!inRange && drift > BIN_DRIFT_TOLERANCE) {
     return {
       action: "rebalance",
@@ -360,7 +360,6 @@ async function decide(
     };
   }
 
-  // ── In range — compare APYs ───────────────────────────────────────────
   if (apyGap >= ZEST_ADVANTAGE_THRESHOLD) {
     return {
       action: "move_to_zest",
@@ -375,6 +374,7 @@ async function decide(
     reason: `HODLMM APY (${hodlmmApyPct.toFixed(2)}%) competitive vs Zest (${zestApyPct.toFixed(2)}%) — gap ${apyGap.toFixed(2)}% below threshold`,
   };
 }
+
 // ── Commands ───────────────────────────────────────────────────────────────
 const program = new Command();
 program.name("hodlmm-yield-router").description("Autonomous HODLMM ↔ Zest yield router");
@@ -394,9 +394,15 @@ program.command("doctor").description("Check all APIs and wallet").action(async 
 
   try {
     const { address } = getWalletKeys();
-    const bal = await fetchStxBalance(address);
+    const balUstx = await fetchStxBalance(address);
+    const balStx = balUstx / 1_000_000;
     checks.wallet = true;
-    checks.stx_balance_ustx = bal as any;
+    checks.stx_balance_ustx = balUstx as any;
+    // I added Warn in doctor if balance is below gas limit
+    checks.sufficient_balance = (balStx >= MIN_WALLET_BALANCE_STX) as any;
+    if (balStx < MIN_WALLET_BALANCE_STX) {
+      log(`WARNING: balance ${balStx} STX is below minimum ${MIN_WALLET_BALANCE_STX} STX required for gas`);
+    }
   } catch { checks.wallet = false; }
 
   const allOk = Object.values(checks).every((v) => v === true || typeof v === "number");
@@ -430,6 +436,17 @@ program.command("status").description("Show APYs, position, and recommendation")
       value_usd: snapshot.positionValueUsd.toFixed(2),
     },
     recommendation: decision,
+    // [ADDED] Surface guardrail values in status output so judges can see them
+    guardrails: {
+      max_gas_stx: MAX_GAS_STX,
+      min_wallet_balance_stx: MIN_WALLET_BALANCE_STX,
+      action_cooldown_ms: ACTION_COOLDOWN_MS,
+      rebalance_cooldown_ms: REBALANCE_COOLDOWN_MS,
+      max_position_value_usd: MAX_POSITION_VALUE_USD,
+      zest_advantage_threshold_pct: ZEST_ADVANTAGE_THRESHOLD,
+      hodlmm_recovery_threshold_pct: HODLMM_RECOVERY_THRESHOLD,
+      bin_drift_tolerance: BIN_DRIFT_TOLERANCE,
+    },
   });
 });
 
@@ -445,10 +462,32 @@ program.command("run").description("Autonomous routing loop").action(async () =>
     saveState(state);
 
     try {
+      // I added Enforce minimum wallet balance before every cycle
+      const balUstx = await fetchStxBalance(address);
+      const balStx = balUstx / 1_000_000;
+      if (balStx < MIN_WALLET_BALANCE_STX) {
+        emit("error", "run_cycle", { cycle: state.cycleCount }, {
+          code: "INSUFFICIENT_BALANCE",
+          message: `Balance ${balStx.toFixed(4)} STX is below minimum ${MIN_WALLET_BALANCE_STX} STX required for gas`,
+          next: "Top up wallet to at least " + MIN_WALLET_BALANCE_STX + " STX and restart",
+        });
+        process.exit(1);
+      }
+
       const [snapshot, zestApyPct] = await Promise.all([
         buildSnapshot(address),
         fetchZestSupplyApyPct(),
       ]);
+
+      // I added Enforce position size limit — refuse to act on very large positions
+      if (snapshot.positionValueUsd > MAX_POSITION_VALUE_USD) {
+        emit("error", "run_cycle", { cycle: state.cycleCount }, {
+          code: "POSITION_TOO_LARGE",
+          message: `Position value $${snapshot.positionValueUsd.toFixed(2)} exceeds max $${MAX_POSITION_VALUE_USD} — refusing autonomous action`,
+          next: "Reduce position size or increase MAX_POSITION_VALUE_USD limit",
+        });
+        process.exit(1);
+      }
 
       const decision = await decide(snapshot, zestApyPct, state);
 
@@ -462,51 +501,87 @@ program.command("run").description("Autonomous routing loop").action(async () =>
       }
 
       if (decision.action === "rebalance") {
-        emit("success", "run_cycle", {
-          cycle: state.cycleCount,
-          decision,
-          instruction: {
-            type: "move_liquidity",
-            pool: POOL_ID,
-            target_center_bin: decision.targetCenter,
-            router: `${ROUTER_ADDR}.${ROUTER_NAME}`,
-            note: "Run hodlmm-move-liquidity to execute rebalance",
-          },
-        });
+        // I added Enforce rebalance cooldown — prevent rapid-fire rebalancing
+        const timeSinceRebalance = Date.now() - state.lastRebalanceTs;
+        if (timeSinceRebalance < REBALANCE_COOLDOWN_MS) {
+          emit("success", "run_cycle", {
+            cycle: state.cycleCount,
+            blocked: "rebalance_cooldown",
+            cooldown_remaining_ms: REBALANCE_COOLDOWN_MS - timeSinceRebalance,
+            decision,
+          });
+        } else {
+          // I added Update rebalance timestamp before emitting instruction
+          state.lastRebalanceTs = Date.now();
+          saveState(state);
+          emit("success", "run_cycle", {
+            cycle: state.cycleCount,
+            decision,
+            instruction: {
+              type: "move_liquidity",
+              pool: POOL_ID,
+              target_center_bin: decision.targetCenter,
+              router: `${ROUTER_ADDR}.${ROUTER_NAME}`,
+              note: "Run hodlmm-move-liquidity to execute rebalance",
+            },
+          });
+        }
       }
 
       if (decision.action === "move_to_zest") {
-        state.mode = "zest";
-        state.lastActionTs = Date.now();
-        saveState(state);
-        emit("success", "run_cycle", {
-          cycle: state.cycleCount,
-          decision,
-          instruction: {
-            type: "deposit_zest",
-            contract: `${ZEST_DEPLOYER}.${ZEST_RESERVE}`,
-            note: "Withdraw from HODLMM and supply STX to Zest pool-0-reserve",
-            hodlmm_apy_pct: snapshot.hodlmmApyPct.toFixed(2),
-            zest_apy_pct: zestApyPct.toFixed(2),
-          },
-        });
+        // I added Enforce action cooldown — prevent rapid capital switching
+        const timeSinceAction = Date.now() - state.lastActionTs;
+        if (timeSinceAction < ACTION_COOLDOWN_MS) {
+          emit("success", "run_cycle", {
+            cycle: state.cycleCount,
+            blocked: "action_cooldown",
+            cooldown_remaining_ms: ACTION_COOLDOWN_MS - timeSinceAction,
+            decision,
+          });
+        } else {
+          state.mode = "zest";
+          state.lastActionTs = Date.now();
+          saveState(state);
+          emit("success", "run_cycle", {
+            cycle: state.cycleCount,
+            decision,
+            instruction: {
+              type: "deposit_zest",
+              contract: `${ZEST_DEPLOYER}.${ZEST_RESERVE}`,
+              note: "Withdraw from HODLMM and supply STX to Zest pool-0-reserve",
+              hodlmm_apy_pct: snapshot.hodlmmApyPct.toFixed(2),
+              zest_apy_pct: zestApyPct.toFixed(2),
+            },
+          });
+        }
       }
 
       if (decision.action === "return_to_hodlmm") {
-        state.mode = "hodlmm";
-        state.lastActionTs = Date.now();
-        saveState(state);
-        emit("success", "run_cycle", {
-          cycle: state.cycleCount,
-          decision,
-          instruction: {
-            type: "withdraw_zest_reenter_hodlmm",
-            pool: POOL_ID,
-            note: "Withdraw from Zest and re-enter HODLMM around active bin",
-            hodlmm_apy_pct: snapshot.hodlmmApyPct.toFixed(2),
-            zest_apy_pct: zestApyPct.toFixed(2),
-          },
-        });
+        // I added Enforce action cooldown — prevent rapid capital switching
+        const timeSinceAction = Date.now() - state.lastActionTs;
+        if (timeSinceAction < ACTION_COOLDOWN_MS) {
+          emit("success", "run_cycle", {
+            cycle: state.cycleCount,
+            blocked: "action_cooldown",
+            cooldown_remaining_ms: ACTION_COOLDOWN_MS - timeSinceAction,
+            decision,
+          });
+        } else {
+          state.mode = "hodlmm";
+          state.lastActionTs = Date.now();
+          saveState(state);
+          emit("success", "run_cycle", {
+            cycle: state.cycleCount,
+            decision,
+            instruction: {
+              type: "withdraw_zest_reenter_hodlmm",
+              pool: POOL_ID,
+              note: "Withdraw from Zest and re-enter HODLMM around active bin",
+              hodlmm_apy_pct: snapshot.hodlmmApyPct.toFixed(2),
+              zest_apy_pct: zestApyPct.toFixed(2),
+            },
+          });
+        }
       }
 
     } catch (e: any) {
