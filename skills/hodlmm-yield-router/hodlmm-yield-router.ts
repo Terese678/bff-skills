@@ -127,6 +127,7 @@ function saveState(state: RouterState) {
 }
 
 // ── Wallet ─────────────────────────────────────────────────────────────────
+// [FIXED] Updated to match AIBTC keystore.json format stored by ID folder
 function getWalletKeys(): { privateKey: string; address: string } {
   const walletSecret = process.env.WALLET_SECRET ?? "";
   const encryptionKey = process.env.ENCRYPTION_KEY ?? "";
@@ -137,21 +138,42 @@ function getWalletKeys(): { privateKey: string; address: string } {
   }
 
   try {
+    // Find wallet by name from wallets.json
     const walletsRaw = fs.readFileSync(WALLETS_FILE, "utf8");
-    const wallets = JSON.parse(walletsRaw);
-    const walletName = walletSecret;
-    const walletPath = path.join(WALLETS_DIR, `${walletName}.enc`);
-    const encryptedData = fs.readFileSync(walletPath, "utf8");
-    const { iv, tag, data } = JSON.parse(encryptedData);
-    const key = crypto.scryptSync(encryptionKey, "salt", 32);
+    const walletsData = JSON.parse(walletsRaw);
+    const wallet = walletsData.wallets.find((w: any) => w.name === walletSecret);
+    if (!wallet) {
+      fatal("wallet", "WALLET_NOT_FOUND",
+        `Wallet "${walletSecret}" not found in wallets.json`,
+        "Check WALLET_SECRET matches a wallet name in ~/.aibtc/wallets.json");
+    }
+
+    // Load keystore.json using wallet ID folder
+    const keystorePath = path.join(WALLETS_DIR, wallet.id, "keystore.json");
+    const keystoreRaw = fs.readFileSync(keystorePath, "utf8");
+    const keystore = JSON.parse(keystoreRaw);
+
+    const { ciphertext, iv, authTag, salt, scryptParams } = keystore.encrypted;
+
+    // Derive key using stored scrypt params from keystore
+    const key = crypto.scryptSync(
+      encryptionKey,
+      Buffer.from(salt, "base64"),
+      scryptParams.keyLen,
+      { N: scryptParams.N, r: scryptParams.r, p: scryptParams.p }
+    );
+
     const decipher = crypto.createDecipheriv(
       "aes-256-gcm",
       key,
-      Buffer.from(iv, "hex")
+      Buffer.from(iv, "base64")
     );
-    decipher.setAuthTag(Buffer.from(tag, "hex"));
+    decipher.setAuthTag(Buffer.from(authTag, "base64"));
+
     const decrypted =
-      decipher.update(data, "hex", "utf8") + decipher.final("utf8");
+      decipher.update(Buffer.from(ciphertext, "base64")).toString("utf8") +
+      decipher.final("utf8");
+
     const { privateKey } = JSON.parse(decrypted);
     const address = getAddressFromPrivateKey(
       privateKey,
@@ -398,7 +420,7 @@ program.command("doctor").description("Check all APIs and wallet").action(async 
     const balStx = balUstx / 1_000_000;
     checks.wallet = true;
     checks.stx_balance_ustx = balUstx as any;
-    // I added Warn in doctor if balance is below gas limit
+    // [ADDED] Warn in doctor if balance is below gas limit
     checks.sufficient_balance = (balStx >= MIN_WALLET_BALANCE_STX) as any;
     if (balStx < MIN_WALLET_BALANCE_STX) {
       log(`WARNING: balance ${balStx} STX is below minimum ${MIN_WALLET_BALANCE_STX} STX required for gas`);
@@ -462,7 +484,7 @@ program.command("run").description("Autonomous routing loop").action(async () =>
     saveState(state);
 
     try {
-      // I added Enforce minimum wallet balance before every cycle
+      // [ADDED] Enforce minimum wallet balance before every cycle
       const balUstx = await fetchStxBalance(address);
       const balStx = balUstx / 1_000_000;
       if (balStx < MIN_WALLET_BALANCE_STX) {
@@ -479,7 +501,7 @@ program.command("run").description("Autonomous routing loop").action(async () =>
         fetchZestSupplyApyPct(),
       ]);
 
-      // I added Enforce position size limit — refuse to act on very large positions
+      // [ADDED] Enforce position size limit — refuse to act on very large positions
       if (snapshot.positionValueUsd > MAX_POSITION_VALUE_USD) {
         emit("error", "run_cycle", { cycle: state.cycleCount }, {
           code: "POSITION_TOO_LARGE",
@@ -501,7 +523,7 @@ program.command("run").description("Autonomous routing loop").action(async () =>
       }
 
       if (decision.action === "rebalance") {
-        // I added Enforce rebalance cooldown — prevent rapid-fire rebalancing
+        // [ADDED] Enforce rebalance cooldown — prevent rapid-fire rebalancing
         const timeSinceRebalance = Date.now() - state.lastRebalanceTs;
         if (timeSinceRebalance < REBALANCE_COOLDOWN_MS) {
           emit("success", "run_cycle", {
@@ -511,7 +533,7 @@ program.command("run").description("Autonomous routing loop").action(async () =>
             decision,
           });
         } else {
-          // I added Update rebalance timestamp before emitting instruction
+          // [ADDED] Update rebalance timestamp before emitting instruction
           state.lastRebalanceTs = Date.now();
           saveState(state);
           emit("success", "run_cycle", {
@@ -529,7 +551,7 @@ program.command("run").description("Autonomous routing loop").action(async () =>
       }
 
       if (decision.action === "move_to_zest") {
-        // I added Enforce action cooldown — prevent rapid capital switching
+        // [ADDED] Enforce action cooldown — prevent rapid capital switching
         const timeSinceAction = Date.now() - state.lastActionTs;
         if (timeSinceAction < ACTION_COOLDOWN_MS) {
           emit("success", "run_cycle", {
@@ -557,7 +579,7 @@ program.command("run").description("Autonomous routing loop").action(async () =>
       }
 
       if (decision.action === "return_to_hodlmm") {
-        // I added Enforce action cooldown — prevent rapid capital switching
+        // [ADDED] Enforce action cooldown — prevent rapid capital switching
         const timeSinceAction = Date.now() - state.lastActionTs;
         if (timeSinceAction < ACTION_COOLDOWN_MS) {
           emit("success", "run_cycle", {
