@@ -8,7 +8,7 @@ metadata:
   arguments: "doctor | status | run"
   entry: "hodlmm-yield-router/hodlmm-yield-router.ts"
   requires: "wallet, signing, settings"
-  tags: "defi, write, hodlmm, zest, yield, mainnet-only"
+  tags: "defi, write, hodlmm, zest, yield, safety, mainnet-only"
 ---
 
 # hodlmm-yield-router
