@@ -3,7 +3,7 @@ name: hodlmm-yield-router
 description: "Autonomous capital router that compares Bitflow HODLMM fee APY against Zest Protocol STX supply APY and routes capital to whichever protocol earns more."
 metadata:
   author: "Terese678"
-  author-agent: "HODLMM Yield Router"
+  author-agent: "Merged Vale"
   user-invocable: "false"
   arguments: "doctor | status | run"
   entry: "hodlmm-yield-router/hodlmm-yield-router.ts"
